@@ -50,3 +50,8 @@ port/recomp/
 # Backups and merge leftovers
 *.bak*
 *.orig
+
+# Runtime output from a local run
+save/
+icall_targets.dump
+xbox_kernel.log
