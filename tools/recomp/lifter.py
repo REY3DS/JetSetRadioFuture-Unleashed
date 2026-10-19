@@ -1653,9 +1653,12 @@ class Lifter:
             return [f"/* shld: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
-        cnt = _fmt_operand_read(ops[2])
-        return [_fmt_operand_write(ops[0],
-            f"({dst} << {cnt}) | ({src} >> (32 - {cnt}))") + " /* shld */"]
+        cnt = f"(({_fmt_operand_read(ops[2])}) & 31)"
+        # A zero count leaves the destination (and the flags) alone; the
+        # unguarded "32 - 0" shift was undefined and ORed the source in.
+        stmt = _fmt_operand_write(ops[0],
+            f"({dst} << _n) | ({src} >> ((32 - _n) & 31))")
+        return [f"{{ uint32_t _n = {cnt}; if (_n) {{ {stmt} }} }} /* shld */"]
 
     def _lift_shrd(self, insn, ops):
         """SHRD: double-precision shift right."""
@@ -1663,9 +1666,11 @@ class Lifter:
             return [f"/* shrd: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
-        cnt = _fmt_operand_read(ops[2])
-        return [_fmt_operand_write(ops[0],
-            f"({dst} >> {cnt}) | ({src} << (32 - {cnt}))") + " /* shrd */"]
+        cnt = f"(({_fmt_operand_read(ops[2])}) & 31)"
+        # See _lift_shld: a zero count must not touch the destination.
+        stmt = _fmt_operand_write(ops[0],
+            f"({dst} >> _n) | ({src} << ((32 - _n) & 31))")
+        return [f"{{ uint32_t _n = {cnt}; if (_n) {{ {stmt} }} }} /* shrd */"]
 
     def _lift_imul(self, insn, ops):
         nops = len(ops)
@@ -1715,12 +1720,19 @@ class Lifter:
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        # x86 masks the count to five bits (six for a 64-bit operand, which
+        # this 32-bit target never has). C leaves a shift at or above the
+        # operand width undefined, so a constant like "shl eax, 0x80" means
+        # zero on x86 and something else elsewhere. Mask it here.
+        cnt = f"(({_fmt_operand_read(ops[1])}) & 31)"
         out = []
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
             # CF is the last bit shifted out; a zero count leaves CF alone.
-            bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
+            # A count past the operand width shifts every bit out; masking
+            # the index saturates on the top bit of the value, which is 0
+            # for a count more than the width and the low bit at exactly it.
+            bit = f"({cnt}) - 1" if c_op == ">>" else f"({w} - ({cnt})) & 31"
             out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
         out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
         return out
@@ -1729,11 +1741,17 @@ class Lifter:
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        cnt = f"(({_fmt_operand_read(ops[1])}) & 31)"
+        w = (_operand_width(ops[0]) or 4) * 8
+        # A byte or word operand sign-extends into the 32-bit shift: SAR is
+        # defined on the value's own width, and a zero-extended read would
+        # turn a negative byte positive before the shift.
+        sx = {8: "(int32_t)(int8_t)", 16: "(int32_t)(int16_t)"}.get(w, "(int32_t)")
+        val = f"{sx}({dst})"
         out = []
         if self.needs_cf:
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> (({cnt}) - 1)) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})"))
+            out.append(f"if ({cnt}) _cf = (int)(({val} >> (({cnt}) - 1)) & 1);")
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)({val} >> {cnt})"))
         return out
 
     def _lift_rotate(self, insn, ops, m):
@@ -1741,7 +1759,10 @@ class Lifter:
             return [f"/* {m}: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        func = "ROL32" if m == "rol" else "ROR32"
+        w = (_operand_width(ops[0]) or 4) * 8
+        # ROL32 on a byte rotates through bits 8..31, which x86 does not do.
+        func = {8: "ROL8", 16: "ROL16", 32: "ROL32"}.get(w, "ROL32") if m == "rol" \
+            else {8: "ROR8", 16: "ROR16", 32: "ROR32"}.get(w, "ROR32")
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
     def _lift_rotate_carry(self, insn, ops, m):
@@ -1761,7 +1782,7 @@ class Lifter:
             body = (f"_rv = ((_rv << 1) | (uint32_t)_cf) & {mask};"
                     f" _cf = (int)((_ro >> {w - 1}) & 1); _ro = _rv;")
         return [f"{{ uint32_t _ro = (uint32_t)({dst}) & {mask}, _rv = _ro;"
-                f" uint32_t _rn = ((uint32_t)({cnt})) % {w + 1}u;"
+                f" uint32_t _rn = (((uint32_t)({cnt})) & 31u) % {w + 1}u;"
                 f" while (_rn--) {{ {body} }}"
                 f" {_fmt_operand_write(ops[0], '_rv')} }} /* {m} */"]
 

@@ -839,12 +839,34 @@ static inline uint32_t SUB32_CF(uint32_t a, uint32_t b, int *cf) {
 
 static inline uint32_t ROL32(uint32_t val, int n) {
     n &= 31;
-    return (val << n) | (val >> (32 - n));
+    return (val << n) | (val >> ((32 - n) & 31));
 }
 
 static inline uint32_t ROR32(uint32_t val, int n) {
     n &= 31;
-    return (val >> n) | (val << (32 - n));
+    return (val >> n) | (val << ((32 - n) & 31));
+}
+
+/* Narrow rotations stay inside the operand's own width, as x86 does: a
+ * 32-bit rotate of a byte walks bits through 8..31 that do not exist. */
+static inline uint32_t ROL8(uint32_t val, int n) {
+    n &= 7; val &= 0xFFu;
+    return ((val << n) | (val >> (8 - n))) & 0xFFu;
+}
+
+static inline uint32_t ROL16(uint32_t val, int n) {
+    n &= 15; val &= 0xFFFFu;
+    return ((val << n) | (val >> (16 - n))) & 0xFFFFu;
+}
+
+static inline uint32_t ROR8(uint32_t val, int n) {
+    n &= 7; val &= 0xFFu;
+    return ((val >> n) | (val << (8 - n))) & 0xFFu;
+}
+
+static inline uint32_t ROR16(uint32_t val, int n) {
+    n &= 15; val &= 0xFFFFu;
+    return ((val >> n) | (val << (16 - n))) & 0xFFFFu;
 }
 
 /* ================================================================
