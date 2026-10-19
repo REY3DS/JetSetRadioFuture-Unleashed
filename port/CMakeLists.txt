@@ -26,6 +26,13 @@ endif()
 
 project(jsrf_recomp C)
 
+# Nintendo Switch (devkitA64). The runtime detects it the same way; declared
+# again here because this file is the top-level one and sets it before the
+# runtime's own CMakeLists runs.
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    set(SWITCH ON)
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -106,6 +113,11 @@ else()
         ${JSRF_GEN_SOURCES}
     )
 endif()
+if(SWITCH)
+    # The Switch harness: libnx startup, the folders on the SD card, and the
+    # frame/input glue around the engine (port/switch/jsrf_switch.c).
+    target_sources(jsrf_recomp PRIVATE switch/jsrf_switch.c)
+endif()
 if(IOS)
     # The iPhone / iPad app around the engine (ios/jsrf_ios.m: the window,
     # the controls, the game in Documents) and the disc-image unpacker. The
@@ -156,6 +168,10 @@ if(WIN32 AND XBOXRECOMP_WIN_GL)
     target_link_options(jsrf_recomp PRIVATE "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/jsrf_recomp.map")
 elseif(WIN32)
     target_link_libraries(jsrf_recomp PRIVATE d3d11 dxgi dxguid xinput winmm dbghelp)
+elseif(SWITCH)
+    # libnx, SDL2 and OpenGL ES arrive through the runtime's targets and the
+    # devkitA64 toolchain's specs (-lnx -lm); there is nothing to name here.
+    # The .nro the console runs is packed after the link, below.
 elseif(ANDROID)
     # pthreads are in bionic's libc; log and android for the glue.
     target_include_directories(jsrf_recomp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ios")
@@ -172,4 +188,19 @@ endif()
 if(MSVC)
     target_link_options(jsrf_recomp PRIVATE /LARGEADDRESSAWARE)
     target_compile_options(jsrf_recomp PRIVATE /bigobj)
+endif()
+
+if(SWITCH)
+    # A .nro the console can run: nacptool writes the title metadata and
+    # elf2nro wraps the linked ELF. Both paths come from devkitPro's
+    # cmake/Switch.cmake, which found them as NX_NACPTOOL_EXE / NX_ELF2NRO_EXE.
+    set(_jsrf_nacp "${CMAKE_CURRENT_BINARY_DIR}/jsrf_recomp.nacp")
+    add_custom_command(TARGET jsrf_recomp POST_BUILD
+        COMMAND "${NX_NACPTOOL_EXE}" --create
+                "Jet Set Radio Future Unleashed" "jsrf" "${JSRF_VERSION}" "${_jsrf_nacp}"
+        COMMAND "${NX_ELF2NRO_EXE}" "$<TARGET_FILE:jsrf_recomp>"
+                "${CMAKE_CURRENT_BINARY_DIR}/jsrf_recomp.nro"
+                --nacp="${_jsrf_nacp}" --icon="${NX_DEFAULT_ICON}"
+        COMMENT "Packing jsrf_recomp.nro"
+        VERBATIM)
 endif()

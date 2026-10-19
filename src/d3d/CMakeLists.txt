@@ -16,7 +16,7 @@ if(WIN32 AND NOT XBOXRECOMP_WIN_GL)
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
-elseif(APPLE OR XBOXRECOMP_WIN_GL OR ANDROID)
+elseif(APPLE OR XBOXRECOMP_WIN_GL OR ANDROID OR SWITCH)
     # Nothing to build: a title that brings its own D3D (JSRF's is linked into
     # its executable) reaches the GPU through the pushbuffer and nv2a_gl, and
     # the OpenGL D3D8 below wants SDL2 and libepoxy, which a Mac only has

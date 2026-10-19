@@ -95,6 +95,12 @@ if(ANDROID)
     set(NV2A_GLES ON)
     set(NV2A_GL_CONTEXT "sdl")
 endif()
+if(SWITCH)
+    # Switch: SDL2 on this host speaks EGL/OpenGL ES 3.2 through mesa's
+    # tegra/nouveau driver, and has no desktop OpenGL at all.
+    set(NV2A_GLES ON)
+    set(NV2A_GL_CONTEXT "sdl")
+endif()
 if(NV2A_GLES AND NOT NV2A_GL_CONTEXT STREQUAL "sdl")
     message(FATAL_ERROR "NV2A_GLES needs NV2A_GL_CONTEXT=sdl")
 endif()

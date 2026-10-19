@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(xboxrecomp VERSION 0.8.0 LANGUAGES C)
 
+# Nintendo Switch (devkitA64): SDL2 brings EGL/OpenGL ES 3.2 as it does on
+# Android, but the host has no user-space virtual memory to place the guest's
+# 4 GB address space in -- see src/platform/xbox_switch.h. One flag so every
+# subdirectory below can ask SWITCH, as it does APPLE or ANDROID.
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    set(SWITCH ON)
+endif()
+
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
 # Pattern: extract emulator subsystems (xemu) into reusable static libraries.

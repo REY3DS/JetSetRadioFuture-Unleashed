@@ -43,6 +43,9 @@
 #else
 #if defined(__ANDROID__)
 #include "platform/android_backtrace.h"   /* <execinfo.h> is API 33 and later */
+#elif defined(__SWITCH__)
+/* devkitA64's newlib has neither <execinfo.h> nor <dlfcn.h>, and no
+ * <ucontext.h>: the crash diagnostics below are the guest's own. */
 #else
 #include <execinfo.h>
 #endif
@@ -51,14 +54,18 @@
  * declarations the rest of this file needs. All that is wanted from it is the
  * ucontext_t type a signal handler is handed, and <signal.h> already declares
  * that on both platforms. */
-#ifndef __APPLE__
+#if defined(__SWITCH__)
+/* no ucontext_t here */
+#elif !defined(__APPLE__)
 #include <ucontext.h>
 #else
 #include <TargetConditionals.h>   /* TARGET_OS_IPHONE: the iOS build */
 #endif
 #include <unistd.h>
 #include <pthread.h>
+#if !defined(__SWITCH__)
 #include <dlfcn.h>
+#endif
 #endif /* !_WIN32 */
 #include "win32_compat.h"
 #include "recomp_icall_feedback.h"
@@ -1035,6 +1042,15 @@ int main(int argc, char **argv)
     {
         extern int nv_android_main(int argc, char **argv, int (*host)(void));
         return nv_android_main(argc, argv, host_main);
+    }
+#endif
+#if defined(__SWITCH__)
+    /* Switch: port/switch/jsrf_switch.c sets the environment, the SD-card
+     * folders and the log, and runs host_main on a thread with a large stack
+     * (libnx's main thread has a megabyte). */
+    {
+        extern int nv_switch_main(int argc, char **argv, int (*host)(void));
+        return nv_switch_main(argc, argv, host_main);
     }
 #endif
     if (argc > 1) g_game_dir_arg = argv[1];
