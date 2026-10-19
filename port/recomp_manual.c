@@ -224,6 +224,13 @@ static void manual_sub_001A308E(void)
     g_esp += 4; return;                      /* ret */
 }
 
+/* The generated dispatch names the body sub_0013B180_gen, so this override is
+ * only reachable through recomp_lookup_manual(): the indirect call at
+ * 0x00147EBB goes through the ICALL path, which consults this table first.
+ * The seeded table that would normally carry this mapping is an empty stub in
+ * public builds, so register it explicitly. */
+void sub_0013B180(void);   /* defined below: cooperative spin-thread override */
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
     /*
@@ -247,6 +254,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
         }
         if (manual_on) {
             recomp_func_t f;
+            if (xbox_va == 0x0013B180u) return sub_0013B180;
             if (xbox_va == 0x001A308Eu) return manual_sub_001A308E;
             f = seeded_lookup(xbox_va);
             if (f) return f;
