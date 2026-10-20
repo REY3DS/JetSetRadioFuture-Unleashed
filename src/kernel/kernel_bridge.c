@@ -68,8 +68,29 @@ int  xbox_worker_stack_alloc(void);
 
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
-/* Memory access - same as recomp_types.h MEM32 but without the #define guard */
-#define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
+/* Memory access - same as recomp_types.h MEM32 but without the #define guard.
+ *
+ * Adding the offset is only valid where the whole guest address space is one
+ * linear mapping, which is what the host build reserves. The Switch maps RAM
+ * and every device window as separate allocations, so the addition stops
+ * being true exactly at the addresses a title uses to talk to the hardware:
+ * BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) turned 0xFD600100 into
+ * "RAM base + 0xFD600100", four gigabytes past a 64 MB block, and took the
+ * vblank thread down with it on the first frame after KeConnectInterrupt.
+ * Below the RAM size the fast path is still the old addition. */
+#if defined(__SWITCH__)
+extern uint32_t g_xbox_ram_size;
+static inline void *bridge_native_ptr(uint32_t va)
+{
+    if (va < g_xbox_ram_size)
+        return (void *)((uintptr_t)va + (uintptr_t)g_xbox_mem_offset);
+    return xbox_HostPtr(va);
+}
+#define BRIDGE_NATIVE_PTR(va) bridge_native_ptr((uint32_t)(va))
+#else
+#define BRIDGE_NATIVE_PTR(va) ((void *)((uintptr_t)(uint32_t)(va) + (uintptr_t)g_xbox_mem_offset))
+#endif
+#define BRIDGE_MEM32(addr) (*(volatile uint32_t *)BRIDGE_NATIVE_PTR(addr))
 
 /* A guest pointer the TITLE chose, about to be written through.
  *
@@ -92,7 +113,18 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 static int bridge_out_ok(uint32_t va, uint32_t bytes, const char *who)
 {
     size_t mapped = xbox_GetMappedSize();
-    if (va && (va & 3u) == 0 && mapped && (uint64_t)va + bytes <= (uint64_t)mapped)
+#if defined(__SWITCH__)
+    /* RAM and each device window are separate allocations, so the linear size
+     * test describes none of them; ask the same table the translator uses --
+     * otherwise an out-structure in the contiguous block is refused as if the
+     * title had passed a bad pointer. */
+    const int writable = va && (va & 3u) == 0 && xbox_GuestRangeMapped(va, bytes);
+    (void)mapped;
+#else
+    const int writable = va && (va & 3u) == 0 && mapped
+                      && (uint64_t)va + bytes <= (uint64_t)mapped;
+#endif
+    if (writable)
         return 1;
     { static uint32_t said[32]; static int n; int i;
       for (i = 0; i < n; i++) if (said[i] == va) return 0;
@@ -110,7 +142,7 @@ static int bridge_out_ok(uint32_t va, uint32_t bytes, const char *who)
 }
 
 /* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */
-#define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)(va) + g_xbox_mem_offset) : NULL)
+#define XBOX_TO_NATIVE(va) ((va) ? BRIDGE_NATIVE_PTR(va) : NULL)
 
 /* ── Synthetic VA range (for function exports) ─────────── */
 
@@ -128,10 +160,10 @@ static int bridge_out_ok(uint32_t va, uint32_t bytes, const char *who)
  * it with the expected structures.
  */
 
-#define BRIDGE_MEM16(addr) (*(volatile uint16_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define BRIDGE_MEM16(addr) (*(volatile uint16_t *)BRIDGE_NATIVE_PTR(addr))
 #define STATUS_USER_APC_VALUE 0x000000C0u
 int bridge_deliver_pending_apcs(void);
-#define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)BRIDGE_NATIVE_PTR(addr))
 
 /**
  * Get the Xbox VA of data for a kernel DATA export ordinal.
@@ -728,7 +760,7 @@ static void bridge_MmAllocateSystemMemory(void)
     }
     xbox_va = xbox_HeapAlloc(size, 4096);
     if (xbox_va)
-        memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+        memset(BRIDGE_NATIVE_PTR(xbox_va), 0, size);
     else
         fprintf(stderr, "  [KERNEL] MmAllocateSystemMemory: %u bytes REFUSED\n",
                 size);
@@ -772,7 +804,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
          * pool headers and free-list roots are assumed clear, so whatever the
          * backing view happened to contain shows up later as structures that
          * are "allocated" but full of garbage. */
-        memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+        memset(BRIDGE_NATIVE_PTR(xbox_va), 0, size);
 
         if (KERNEL_LOG_ON_HALF()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
@@ -1202,7 +1234,7 @@ static void bridge_ExQueryNonVolatileSetting(void)
     NTSTATUS st = xbox_ExQueryNonVolatileSetting(
         value_index,
         type_va   ? (PULONG)&BRIDGE_MEM32(type_va)   : NULL,
-        value_va  ? (PVOID)((uintptr_t)value_va + g_xbox_mem_offset) : NULL,
+        value_va  ? (PVOID)BRIDGE_NATIVE_PTR(value_va) : NULL,
         value_length,
         result_va ? (PULONG)&BRIDGE_MEM32(result_va) : NULL);
 
@@ -7729,6 +7761,10 @@ void xbox_kernel_bridge_init(void)
 #define backtrace(buf, n) ((int)CaptureStackBackTrace(0, (DWORD)(n), (buf), NULL))
 #elif defined(__ANDROID__)
 #include "../platform/android_backtrace.h"   /* <execinfo.h> is API 33 and later */
+#elif defined(__SWITCH__)
+/* newlib has no <execinfo.h> and the console offers no unwinder to one: the
+ * watched-store report is a host diagnostic, and this host's chain is empty. */
+#define backtrace(buf, n) ((void)(buf), (void)(n), 0)
 #else
 #include <execinfo.h>
 #endif

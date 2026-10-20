@@ -36,6 +36,11 @@
 #include "nv2a_gl.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+#if defined(__SWITCH__)
+/* The device apertures are windows outside the linear map here, so an
+ * address in one is translated, not added to a base (xbox_HostPtr). */
+void *xbox_HostPtr(uint32_t guest_va);
+#endif
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
@@ -1423,8 +1428,15 @@ static int s_sem_base_known;
  * *ok when the entry is not the one asked for. */
 static uint32_t dma_object_base(uint32_t handle, int *ok)
 {
+#if defined(__SWITCH__)
+    /* The NV2A aperture is an allocation of its own, not an offset from
+     * RAM; nv2a stays 0 so every offset below is from that window. */
+    const uint8_t *mem = (const uint8_t *)xbox_HostPtr(0xFD000000u);
+    const uint32_t nv2a = 0;
+#else
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint32_t nv2a = 0xFD000000u;
+#endif
     uint32_t ramht = *(const uint32_t *)(mem + nv2a + 0x002210);
     uint32_t push1 = *(const uint32_t *)(mem + nv2a + 0x003204);
     uint32_t size = 1u << (((ramht >> 16) & 3u) + 12u);
@@ -1483,8 +1495,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     fprintf(stderr, "  [SEM] semaphore DMA handle 0x%08X -> physical base 0x%08X%s\n",
                             s_sem_handle, s_sem_base, ok ? "" : " (RAMHT lookup failed, assuming 0)"); fflush(stderr); }
                 va = dma_resolve(s_sem_base + s_sem_offset);
+                /* dma_resolve returns a guest VA, and a contiguous
+                 * allocation's VA is 0x80000000+P -- not an offset from the
+                 * RAM base on the Switch, where the two are separate
+                 * allocations. */
                 if (va >= 0x1000u && va + 4 <= 0xFFFFFFFCu)
-                    *(volatile uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = param;
+                    *(volatile uint32_t *)xbox_HostPtr(va) = param;
             }
         }
     }

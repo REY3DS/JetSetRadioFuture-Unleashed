@@ -87,7 +87,23 @@ static void *sa_fake_sink(void *arg)
     for (;;) {
         next.tv_nsec += period_ns;
         while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+#if defined(__SWITCH__)
+        /* newlib's clock_nanosleep sits behind _POSIX_CLOCK_SELECTION, which
+         * this build does not set, so the deadline becomes a relative sleep.
+         * This is the fake sink -- a test path -- and its pacing is what the
+         * ring needs, not absolute time. */
+        {
+            struct timespec now, rel;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            rel.tv_sec  = next.tv_sec  - now.tv_sec;
+            rel.tv_nsec = next.tv_nsec - now.tv_nsec;
+            if (rel.tv_nsec < 0) { rel.tv_nsec += 1000000000L; rel.tv_sec--; }
+            if (rel.tv_sec < 0) { rel.tv_sec = 0; rel.tv_nsec = 0; }
+            nanosleep(&rel, NULL);
+        }
+#else
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+#endif
         sa_pull(scratch, SA_BUF_FRAMES);
         if (raw) fwrite(scratch, sizeof scratch, 1, raw);
     }

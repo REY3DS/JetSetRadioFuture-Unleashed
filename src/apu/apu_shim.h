@@ -95,6 +95,10 @@ static inline void qemu_thread_join(QemuThread *t) {
 
 extern uint8_t *g_apu_ram_ptr;   /* the contiguous window, at guest 0x80000000 */
 extern int g_apu_window_only;    /* RECOMP_APU_WINDOW_ALL=1: the old behaviour */
+#if defined(__SWITCH__)
+/* Ordinary RAM is translated here, not an offset from g_apu_ram_ptr. */
+void *xbox_HostPtr(uint32_t guest_va);
+#endif
 
 /*
  * A physical address, as this runtime means it.
@@ -119,8 +123,15 @@ extern int g_apu_window_only;    /* RECOMP_APU_WINDOW_ALL=1: the old behaviour *
 static inline uint8_t *apu_phys_ptr(hwaddr addr)
 {
     uint32_t a = (uint32_t)addr;
-    if (!g_apu_window_only && !(a & 0x80000000u))
+    if (!g_apu_window_only && !(a & 0x80000000u)) {
+#if defined(__SWITCH__)
+        /* The two routes are two allocations: ordinary RAM, which
+         * translates on its own, and the window at g_apu_ram_ptr. */
+        return (uint8_t *)xbox_HostPtr(a & 0x03FFFFFFu);
+#else
         return g_apu_ram_ptr - 0x80000000u + (a & 0x03FFFFFFu);
+#endif
+    }
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
 

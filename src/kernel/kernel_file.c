@@ -23,6 +23,12 @@
                           * twenty-five years. */
 
 #if !defined(_WIN32)
+#if defined(__SWITCH__)
+/* kernel_path.c: nominal size of the partition image behind a host path, or 0
+ * if it is not one.  Only the Switch needs it (there the images are neither
+ * sparse nor preallocated); declared here so kernel.h stays untouched. */
+unsigned long long xbox_partition_image_size(const char *host_path);
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -30,6 +36,14 @@
 #include <sys/statvfs.h>
 #include <dirent.h>
 #include <fnmatch.h>
+#endif
+
+#if defined(__SWITCH__)
+/* newlib declares statvfs but not fstatvfs. The one caller wants the volume
+ * the file lives on, and clamps the answer to the console's 750 MB cache
+ * partition anyway, so the fallback it already has -- console-sized numbers --
+ * is the right answer here rather than a host-sized one. */
+#define fstatvfs(fd, buf) (-1)
 #endif
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
@@ -852,15 +866,49 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     int fd;
+    int path_only_dir = 0;
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             mkdir(host_path, 0755);   /* EEXIST is fine */
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
+#if defined(__SWITCH__)
+        /*
+         * devkitA64 serves the card through FatFS, whose f_open() refuses a
+         * directory outright, so the call above always fails here with ENOENT
+         * -- and a title that opens the volume root before enumerating it
+         * with NtQueryDirectoryFile is then told the partition does not
+         * exist.  JSRF answers that by deciding it was launched without data
+         * and calling HalReturnToFirmware(2).
+         *
+         * Enumeration and the free-space query both work from the path kept
+         * in the handle (opendir/statvfs), so a handle without a descriptor
+         * is enough.  w32_open_handle(-1, ...) is safe: obj_release only
+         * closes the descriptor when it is >= 0.
+         *
+         * The stat() is what keeps the "is this a folder?" probe honest: on a
+         * plain file the console answers STATUS_NOT_A_DIRECTORY, and a title
+         * probing that way needs to hear it here too.
+         */
+        {
+            struct stat dst;
+            if (stat(host_path, &dst) == 0) {
+                if (S_ISDIR(dst.st_mode)) {
+                    if (fd < 0) {
+                        path_only_dir = 1;   /* FatFS refuses directories */
+                    }
+                } else {
+                    if (fd >= 0) close(fd);
+                    fd = -1;
+                    errno = ENOTDIR;
+                }
+            }
+        }
+#endif
     } else {
         fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
     }
 
-    if (fd < 0) {
+    if (fd < 0 && !path_only_dir) {
         int e = errno;
         NTSTATUS st = errno_to_status(e);
         /* FILE_DIRECTORY_FILE on something that exists but is a plain file:
@@ -916,6 +964,24 @@ NTSTATUS __stdcall xbox_NtReadFile(
         IoStatusBlock->Information = 0;
         return STATUS_UNSUCCESSFUL;
     }
+
+#if defined(__SWITCH__)
+    /* Raw sector reads from a partition device.  The image only holds what the
+     * title has written (see posix_create_partition_images), so a region it
+     * has never touched runs into EOF -- but on the console that sector is
+     * zeroes, not an error.  Ordinary files keep the short count and their
+     * EOF; device handles get a full read of zeroes. */
+    if ((ULONG)n < Length) {
+        const char *hp = w32_handle_path(FileHandle);
+        if (hp && xbox_partition_image_size(hp) > 0) {
+            memset((uint8_t *)Buffer + n, 0, Length - (ULONG)n);
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = Length;
+            if (Event) SetEvent(Event);
+            return STATUS_SUCCESS;
+        }
+    }
+#endif
 
     /* A short read leaves the rest of the buffer as the title found it.
      *
@@ -1013,13 +1079,33 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
         return STATUS_INVALID_PARAMETER;
 
     int fd = w32_handle_fd(FileHandle);
-    if (fd < 0)
-        return STATUS_INVALID_HANDLE;
 
     struct stat st;
     if (FileInformationClass != XboxFilePositionInformation) {
-        if (fstat(fd, &st) != 0)
-            return STATUS_UNSUCCESSFUL;
+        int got = 0;
+        if (fd >= 0) {
+            got = fstat(fd, &st) == 0;
+        }
+#if defined(__SWITCH__)
+        else {
+            /* A directory handle open without a descriptor (see
+             * xbox_NtCreateFile): attributes and size come from the path, so
+             * the usual "is this a directory?" probes still answer. */
+            const char *hp = w32_handle_path(FileHandle);
+            got = hp && stat(hp, &st) == 0;
+        }
+#endif
+        if (!got)
+            return (fd < 0) ? STATUS_INVALID_HANDLE : STATUS_UNSUCCESSFUL;
+#if defined(__SWITCH__)
+        /* A partition image is shorter than the partition it stands for (see
+         * posix_create_partition_images): the guest sizes its cache from this
+         * number, so answer with the retail geometry rather than the few
+         * kilobytes that happen to be on the card. */
+        {   const char *hp = w32_handle_path(FileHandle);
+            unsigned long long psz = hp ? xbox_partition_image_size(hp) : 0;
+            if (psz) st.st_size = (off_t)psz; }
+#endif
     }
 
     switch (FileInformationClass) {
@@ -1097,6 +1183,19 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         }
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+#if defined(__SWITCH__)
+            /* Growing a partition image would materialise the retail geometry
+             * on an exFAT card (see posix_create_partition_images).  Truncating
+             * down is a real erase and costs nothing, so it still happens. */
+            {   const char *hp = w32_handle_path(FileHandle);
+                struct stat st;
+                if (hp && xbox_partition_image_size(hp) > 0 &&
+                    (fstat(fd, &st) != 0 ||
+                     info->EndOfFile.QuadPart >= (LONGLONG)st.st_size)) {
+                    IoStatusBlock->Status = STATUS_SUCCESS;
+                    return STATUS_SUCCESS;
+                } }
+#endif
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
@@ -1143,11 +1242,22 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
+            int have_fs;
             /* Xbox geometry, not the host's -- see the note on
              * XBOX_SECTORS_PER_CLUSTER above. */
             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
             info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
-            if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
+            have_fs = (fd >= 0) && fstatvfs(fd, &vfs) == 0;
+#if defined(__SWITCH__)
+            if (!have_fs) {
+                /* A directory handle opened without a descriptor (see
+                 * xbox_NtCreateFile): ask the path, or the title's cache
+                 * builder is handed invented numbers. */
+                const char *hp = w32_handle_path(FileHandle);
+                if (hp) have_fs = statvfs(hp, &vfs) == 0;
+            }
+#endif
+            if (have_fs) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
                 ULONGLONG avail = (ULONGLONG)vfs.f_bavail * vfs.f_frsize;
@@ -1172,7 +1282,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                           p ? p : "?", (unsigned long long)info->AvailableAllocationUnits.QuadPart,
                           (unsigned long long)info->TotalAllocationUnits.QuadPart,
                           (unsigned)(info->BytesPerSector * info->SectorsPerAllocationUnit),
-                          fd >= 0 ? "" : " (no fd: made-up numbers)");
+                          have_fs ? "" : " (no filesystem: made-up numbers)");
               } }
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);

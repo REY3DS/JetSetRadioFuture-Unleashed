@@ -539,8 +539,10 @@ static void posix_write_partition_table(const char *path)
         memcpy(e + 24, &parts[i].size, 4);
     }
     pwrite(fd, sector, sizeof(sector), XBOX_PART_TABLE_OFFSET);
+#if !defined(__SWITCH__)
     /* whole disk: 0x9C4400 sectors (retail 5 GB geometry) */
     ftruncate(fd, (off_t)0x009C4400ull * 512);
+#endif
     close(fd);
 }
 
@@ -555,12 +557,44 @@ static void posix_create_partition_images(void)
         snprintf(image, sizeof(image), "%s/Partition%d.img", s_save_dir, p);
         int fd = open(image, O_RDWR | O_CREAT, 0644);
         if (fd < 0) continue;
+#if defined(__SWITCH__)
+        /* exFAT through FatFS has no sparse files, so the retail geometry
+         * below would sit 10.5 GB on the card -- and the 5 GB whole-disk
+         * image does not even fit on a FAT32 card.  On the host these images
+         * are sparse and all the title ever touches is one sector of the disk
+         * image and ~116 KB of the cache partition; partitions 1..4 are never
+         * opened as devices at all.  Leave the files empty and let them grow
+         * only as far as the title writes: xbox_partition_image_size()
+         * reports the retail geometry to the guest and reads past the end come
+         * back as zeroes, exactly like an unwritten sector. */
+        (void)part_sectors;
+#else
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size == 0)
             ftruncate(fd, (off_t)(part_sectors[p] * 512ull));
+#endif
         close(fd);
     }
 }
+
+#if defined(__SWITCH__)
+unsigned long long xbox_partition_image_size(const char *host_path)
+{
+    static const unsigned long long part_sectors[6] = {
+        0x009C4400ull,   /* whole disk, 5 GB retail geometry */
+        0x00465400ull, 0x000FA000ull,
+        0x00177000ull, 0x00177000ull, 0x00177000ull };
+    const char *base;
+    if (!host_path) return 0;
+    base = strrchr(host_path, '/');
+    base = base ? base + 1 : host_path;
+    if (strncmp(base, "Partition", 9) != 0) return 0;
+    if (base[9] < '0' || base[9] > '5') return 0;
+    if (base[10] != '.' || strncmp(base + 11, "img", 3) != 0 || base[14] != '\0')
+        return 0;
+    return part_sectors[base[9] - '0'] * 512ull;
+}
+#endif
 
 static BOOL posix_partition_device_path(const char *xbox_path, char *out, DWORD n)
 {

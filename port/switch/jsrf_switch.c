@@ -26,6 +26,7 @@
  */
 #include <switch.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,97 @@
 
 /* Where the game lives on the card when argv says nothing. */
 #define SWITCH_ROOT_DEFAULT "sdmc:/switch/JSRFUnleashed"
+
+/*
+ * A crash has to leave something behind: the .nro runs on a console with no
+ * debugger, and the homebrew menu only ever says "the software was closed".
+ * libnx runs this from its exception entry point, with its own stack, before
+ * the kernel kills the title, and it covers every thread in the process --
+ * including the engine's pthread.
+ *
+ * The program counter is a native ARM64 address, so it resolves against the
+ * ELF once the load base is known: the address of this very function is
+ * printed below, and
+ *
+ *   aarch64-none-elf-nm jsrf_recomp.elf | grep __libnx_exception_handler
+ *
+ * gives the link-time value to subtract from it.
+ *
+ * One buffer, one write. The other threads keep running for a few
+ * milliseconds after the fault -- the vblank thread's death let the engine
+ * reach two more allocations -- and a sequence of fprintf calls came out
+ * interleaved and truncated on hardware, so the frame-pointer chain was lost
+ * exactly where it was needed.
+ */
+static char   s_crash_buf[4096];
+static size_t s_crash_len;
+
+static void crash_printf(const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    if (s_crash_len >= sizeof s_crash_buf - 1)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(s_crash_buf + s_crash_len, sizeof s_crash_buf - s_crash_len,
+                  fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        s_crash_len += (size_t)n;
+        if (s_crash_len > sizeof s_crash_buf - 1)
+            s_crash_len = sizeof s_crash_buf - 1;
+    }
+}
+
+void __libnx_exception_handler(ThreadExceptionDump *ctx)
+{
+    int i;
+
+    if (!ctx) return;
+    s_crash_len = 0;
+    crash_printf("\n[CRASH] exception 0x%X esr=0x%08X far=0x%llX\n"
+                 "[CRASH] pc=0x%llX lr=0x%llX sp=0x%llX fp=0x%llX\n",
+                 (unsigned)ctx->error_desc, (unsigned)ctx->esr,
+                 (unsigned long long)ctx->far.x,
+                 (unsigned long long)ctx->pc.x,
+                 (unsigned long long)ctx->lr.x,
+                 (unsigned long long)ctx->sp.x,
+                 (unsigned long long)ctx->fp.x);
+    crash_printf("[CRASH] self=%p tid=%p pstate=0x%X\n",
+                 (void *)(uintptr_t)&__libnx_exception_handler,
+                 (void *)(uintptr_t)pthread_self(),
+                 (unsigned)ctx->pstate);
+    /* x0..x28, four to a line. x18 is the platform register, never ours. */
+    for (i = 0; i < 29; i++) {
+        if (i == 18)
+            continue;
+        if ((i & 3) == 0)
+            crash_printf("[CRASH] ");
+        crash_printf("x%-2d=0x%llX%s", i,
+                     (unsigned long long)ctx->cpu_gprs[i].x,
+                     ((i & 3) == 3 || i == 28) ? "\n" : " ");
+    }
+    /* The call path, from the frame-pointer chain. Bounded to the faulting
+     * thread's stack window so a garbage frame pointer cannot fault the
+     * handler itself. */
+    {
+        unsigned long long fp = (unsigned long long)ctx->fp.x;
+        unsigned long long lo = (unsigned long long)ctx->sp.x & ~0xFFFull;
+        crash_printf("[CRASH] backtrace:");
+        for (i = 0; i < 16; i++) {
+            unsigned long long prev, ret;
+            if (fp < lo || fp > lo + (16ull << 20) || (fp & 15ull)) break;
+            prev = *(volatile unsigned long long *)fp;
+            ret  = *(volatile unsigned long long *)(fp + 8);
+            crash_printf(" %llX", ret);
+            if (prev <= fp) break;
+            fp = prev;
+        }
+        crash_printf("\n");
+    }
+    write(STDERR_FILENO, s_crash_buf, s_crash_len);
+}
 
 static void mkdir_p(const char *path)
 {
@@ -130,8 +222,31 @@ int nv_switch_main(int argc, char **argv, int (*host)(void))
         snprintf(prev, sizeof prev, "%s/previous-run.log", logs);
         rename(last, prev);
         if (freopen(last, "w", stdout) != NULL) {
-            if (!freopen(last, "a", stderr))
-                fprintf(stderr, "[SWITCH] cannot redirect stderr: %s\n", strerror(errno));
+            /*
+             * A second freopen() does not move stderr on devkitA64: it stays
+             * on the console, so every runtime diagnostic ([KERNEL], [HEAP],
+             * [MANUAL], the crash traces) was silently lost and last-run.log
+             * only ever held printf() output.
+             *
+             * dup2() onto stdout's descriptor puts both streams on one file
+             * description: a single shared offset, so stdout and stderr
+             * interleave in the order they were written instead of each one
+             * appending at its own position.
+             */
+            int dup_rc = dup2(fileno(stdout), STDERR_FILENO);
+            int dup_err = errno;
+            if (dup_rc < 0) {
+                /* dup2() is not implemented for every devoptab, so fall back
+                 * to reopening the path for stderr. */
+                FILE *ef;
+                errno = 0;
+                ef = freopen(last, "a", stderr);
+                fprintf(stdout, "[SWITCH] stderr: dup2 failed (%s), freopen=%s\n",
+                        strerror(dup_err), ef ? "ok" : strerror(errno));
+            } else {
+                fprintf(stdout, "[SWITCH] stderr: dup2 -> stdout's description\n");
+            }
+            fflush(stdout);
         } else {
             fprintf(stderr, "[SWITCH] cannot open %s: %s\n", last, strerror(errno));
         }
@@ -151,8 +266,13 @@ int nv_switch_main(int argc, char **argv, int (*host)(void))
     setenv("TMPDIR", cache, 1);
     if (chdir(root) != 0)
         fprintf(stderr, "[SWITCH] cannot enter %s: %s\n", root, strerror(errno));
-    fprintf(stderr, "[SWITCH] JSRF Unleashed %s\n[SWITCH] game: %s\n[SWITCH] log: %s\n",
-            JSRF_VERSION, root, nx >= 0 ? "nxlink" : last);
+    /* Stamp the build: with several .nro files floating between the build
+     * tree and the SD card, the first line of the log is the only reliable
+     * way to tell which binary produced it. */
+    fprintf(stderr, "[SWITCH] JSRF Unleashed %s (built %s %s)\n"
+                    "[SWITCH] game: %s\n[SWITCH] log: %s\n",
+            JSRF_VERSION, __DATE__, __TIME__, root,
+            nx >= 0 ? "nxlink" : last);
 
     call.host = host;
     call.rc = 1;

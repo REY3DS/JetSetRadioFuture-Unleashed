@@ -467,7 +467,37 @@ void recomp_fp_exit(uint32_t va);
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
  * our mapping and causing access violations.
  */
+#if defined(__SWITCH__)
+/* Nintendo Switch: libnx offers no mmap and there are not four spare gigabytes
+ * of virtual address space to place the console's windows in, so the layout is
+ * translated in software instead of mapped linearly -- port/switch/README.md.
+ *
+ * Almost everything the title touches is RAM below g_xbox_ram_size, where the
+ * translation is still the old addition: one load and one predictable branch,
+ * the same shape as the MMIO test that already precedes every access below.
+ * Anything else -- the 26-bit-bus RAM mirror, the tiled aperture at 0xF0000000
+ * and the NV2A, MCPX and flash windows -- goes to the slow path, which
+ * dispatches on the small table xbox_memory_layout.c registers here.
+ */
+extern uint32_t g_xbox_ram_size;
+uintptr_t recomp_xbox_ptr_slow(uint32_t addr);
+void *xbox_HostPtr(uint32_t guest_va);
+
+static inline uintptr_t recomp_xbox_ptr(uint32_t addr)
+{
+    if (addr < g_xbox_ram_size)
+        return (uintptr_t)g_xbox_mem_offset + addr;
+    return recomp_xbox_ptr_slow(addr);
+}
+#define XBOX_PTR(addr) recomp_xbox_ptr((uint32_t)(addr))
+#else
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+/* Guest VA -> host pointer, for the runtime's own accesses. The lifted code
+ * above does not need it: this is for the handful of places outside it -- a
+ * device model following a descriptor, a debug printer -- that hold a guest
+ * address read out of guest memory. */
+void *xbox_HostPtr(uint32_t guest_va);
+#endif
 
 /* ---- Memory-mapped device registers ---------------------------------
  *

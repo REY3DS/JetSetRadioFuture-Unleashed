@@ -29,7 +29,7 @@ static int s_mmio_trace = -1;
 
 static inline volatile void *plain(uint32_t addr)
 {
-    return (volatile void *)((uintptr_t)addr + xbox_GetMemoryOffset());
+    return (volatile void *)xbox_HostPtr(addr);
 }
 
 uint32_t recomp_mmio_read(uint32_t addr, unsigned size)

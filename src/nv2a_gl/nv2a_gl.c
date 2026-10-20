@@ -111,6 +111,9 @@ extern void xbox_guest_lock_retake(int)  __attribute__((weak));
 extern void xbox_nv2a_vblank_service(void) __attribute__((weak));
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+#if defined(__SWITCH__)
+void *xbox_HostPtr(uint32_t guest_va);   /* windows are not inside RAM */
+#endif
 extern uint32_t  xbox_ContiguousAllocatedBytes(void);
 extern uint32_t  xbox_ContiguousBlockSerial(uint32_t va);
 
@@ -949,7 +952,13 @@ static uint32_t resolve(uint32_t off)
 
 static const uint8_t *guest(uint32_t va)
 {
+#if defined(__SWITCH__)
+    /* va may name the contiguous window (0x80000000 + off), which is a
+     * separate allocation here rather than an offset from RAM. */
+    return (const uint8_t *)xbox_HostPtr(va);
+#else
     return (const uint8_t *)xbox_GetMemoryOffset() + va;
+#endif
 }
 
 static uint32_t fnv(const void *p, size_t n)
@@ -8916,7 +8925,11 @@ static void present(int is_frame)
         }
     }
 
+#if defined(__SWITCH__)
+    dst = (uint8_t *)xbox_HostPtr(va);
+#else
     dst = (uint8_t *)xbox_GetMemoryOffset() + va;
+#endif
     for (y = 0; y < g_fbo_h; y++) {
         /* GL's origin is bottom-left and the console's is top-left. */
         const uint8_t *row = g_readback + (size_t)(g_fbo_h - 1 - y) * g_fbo_w * 4;

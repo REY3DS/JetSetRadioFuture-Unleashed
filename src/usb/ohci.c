@@ -362,18 +362,19 @@ static uint32_t rd32(uint32_t va)
 {
     if (!guest_ok(va, 4))
         return 0;
-    return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
+    return *(uint32_t *)xbox_HostPtr(va);
 }
 static void wr32(uint32_t va, uint32_t v)
 {
     if (!guest_ok(va, 4))
         return;
-    *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
+    *(uint32_t *)xbox_HostPtr(va) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
-    return guest_ok(va, bytes)
-         ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
+    /* guest_ok() admits the contiguous window, which is its own allocation on
+     * the Switch; a plain offset from RAM would land outside it. */
+    return guest_ok(va, bytes) ? (uint8_t *)xbox_HostPtr(va) : NULL;
 }
 
 /* Move one transfer descriptor. Returns the condition code to report. */

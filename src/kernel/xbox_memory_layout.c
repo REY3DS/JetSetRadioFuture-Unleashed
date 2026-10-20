@@ -867,6 +867,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 
 static void xbox_Nv2aAckStart(void)
 {
+    /* What this poll carries besides the ack/idle bits: the pushbuffer survey
+     * (which is also what pumps the executor -- nv2a_pb_scan -- and so is the
+     * only thing that ever completes a fence in guest memory) and the
+     * framebuffer checksum. Read here rather than in the per-host aperture
+     * setup: the Switch allocates its windows through guest_window_alloc and
+     * never ran that code, so the flag stayed zero and no pushbuffer was ever
+     * executed there. */
+    s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
+                || getenv("RECOMP_PB_SCAN") != NULL
+                || getenv("RECOMP_PB_EXEC") != NULL;
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
@@ -882,6 +892,132 @@ static void *g_kernel_memory = NULL;
 
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
+
+#if defined(__SWITCH__)
+/* ==========================================================================
+ * Guest address translation on the Nintendo Switch
+ *
+ * libnx has no mmap, no mprotect, and no four spare gigabytes of virtual
+ * address space, so the trick the other hosts use -- reserve the whole guest
+ * span unreadable, then place each window at its exact offset inside it -- has
+ * no equivalent here. What replaces it is a translation: RAM is one aligned
+ * block and every other window is a separate allocation recorded in the table
+ * below, and recomp_types.h's XBOX_PTR sends anything that is not plain RAM to
+ * recomp_xbox_ptr_slow().
+ *
+ * Guest RAM stays linear -- host = g_xbox_mem_offset + guest VA -- which is
+ * the identity every "guest_va + g_xbox_mem_offset" site in the runtime is
+ * written against (the kernel data area at 0x00740000, the thunk table, the
+ * TIB, the stack and the heap are all inside RAM), and the one lifted code
+ * gets on the fast path. Only the windows above 64 MB take the branch.
+ * ======================================================================== */
+
+#define XBOX_GUEST_WINDOWS 12
+
+static struct {
+    uint32_t lo;        /* first guest address, inclusive */
+    uint32_t len;       /* bytes */
+    uint8_t *host;
+} g_guest_windows[XBOX_GUEST_WINDOWS];
+static int g_guest_window_count;
+
+/* Somewhere for an address that names nothing: a read comes back zero and a
+ * write goes nowhere, so an uninitialised pointer is survivable rather than
+ * fatal. The other hosts get this from the reserved span; here it is one page
+ * of scratch. */
+static uint8_t g_guest_scratch[4096];
+
+/* RAM size, as XBOX_PTR's fast path tests it. Set before the first translated
+ * access, and never changed again. */
+uint32_t g_xbox_ram_size = 0;
+
+static void guest_window_add(uint32_t lo, uint32_t len, void *host)
+{
+    if (!host || !len || g_guest_window_count >= XBOX_GUEST_WINDOWS)
+        return;
+    g_guest_windows[g_guest_window_count].lo   = lo;
+    g_guest_windows[g_guest_window_count].len  = len;
+    g_guest_windows[g_guest_window_count].host = (uint8_t *)host;
+    g_guest_window_count++;
+}
+
+/* One aligned, zeroed allocation, never freed: the guest's windows live as
+ * long as the process does and each is taken once, at startup. The alignment
+ * is achieved by over-allocating, whose unused head is left behind on
+ * purpose -- there is no free() to pair it with. */
+static void *guest_window_alloc(size_t size, size_t align)
+{
+    void *raw = calloc(1, size + align);
+    if (!raw)
+        return NULL;
+    return (void *)(((uintptr_t)raw + align - 1) & ~(uintptr_t)(align - 1));
+}
+
+/*
+ * The slow half of XBOX_PTR.
+ *
+ * Device windows first, in the order they were recorded, so a specific page
+ * (the fake kernel image the RenderWare cache code reads) can sit inside a
+ * broad one (the contiguous memory window). Then the tiled aperture, which is
+ * the same RAM a second time at 0xF0000000 -- the window titles render
+ * through. Anything still unclaimed is the memory controller's 26-bit bus
+ * wrapping RAM, which is what makes an address past 64 MB read the low bytes
+ * again.
+ */
+uintptr_t recomp_xbox_ptr_slow(uint32_t addr)
+{
+    int i;
+
+    for (i = 0; i < g_guest_window_count; i++) {
+        const uint32_t lo = g_guest_windows[i].lo;
+        if (addr - lo < g_guest_windows[i].len)
+            return (uintptr_t)(g_guest_windows[i].host + (addr - lo));
+    }
+    if (addr >= 0xF0000000u && addr < 0xFD000000u)      /* tiled / WC */
+        return (uintptr_t)g_memory_base
+             + ((addr - 0xF0000000u) & (g_xbox_ram_size - 1u));
+    if (g_xbox_ram_size)                                /* 26-bit bus wrap */
+        return (uintptr_t)g_memory_base + (addr & (g_xbox_ram_size - 1u));
+    return (uintptr_t)g_guest_scratch;
+}
+
+/*
+ * Whether a guest range has host memory behind it.
+ *
+ * The host builds answer this with one comparison against the mapping size,
+ * because they really do reserve the whole address space. Here RAM and the
+ * device windows are separate blocks, so the question has to be asked of the
+ * table the translator consults -- callers use it to reject a bad out-pointer
+ * before storing through it, and a window range is as writable as RAM.
+ */
+int xbox_GuestRangeMapped(uint32_t va, uint32_t bytes)
+{
+    int i;
+
+    if (!va)
+        return 0;
+    if ((uint64_t)va + bytes <= (uint64_t)g_memory_size)
+        return 1;
+    if (va >= 0xF0000000u && va < 0xFD000000u)      /* tiled / WC mirror */
+        return g_memory_base != NULL;
+    for (i = 0; i < g_guest_window_count; i++) {
+        const uint32_t lo = g_guest_windows[i].lo;
+        if (va - lo < g_guest_windows[i].len
+                && (uint64_t)bytes <= (uint64_t)g_guest_windows[i].len - (va - lo))
+            return 1;
+    }
+    return 0;
+}
+#endif /* __SWITCH__ */
+
+void *xbox_HostPtr(uint32_t guest_va)
+{
+#if defined(__SWITCH__)
+    return (void *)recomp_xbox_ptr_slow(guest_va);
+#else
+    return (void *)((uintptr_t)guest_va + g_xbox_mem_offset);
+#endif
+}
 
 /* Bounds of the title's executable sections, from its own XBE section table.
  *
@@ -1277,7 +1413,7 @@ volatile uint64_t g_icall_count = 0;
 /* Used only by the startup RAM probe below: a store that faults means the
  * backing object is shorter than the mapping claims, and the probe wants to
  * carry on past it rather than die. */
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__SWITCH__)
 static volatile sig_atomic_t g_ram_probe_failed;
 static sigjmp_buf g_ram_probe_jmp;
 
@@ -1324,6 +1460,34 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * With file mapping views, we create aliased mappings at 64 MB intervals
      * that all point to the same physical memory.
      */
+#if defined(__SWITCH__)
+    /*
+     * Guest RAM: one aligned, zeroed block, translated rather than mapped.
+     *
+     * A power of two, because the memory controller's wrap is a mask here.
+     * g_xbox_map_size is ignored: the map and the RAM have to be the same
+     * thing for the wrap to be one rule.
+     */
+    {
+        g_memory_size = g_xbox_total_ram;
+        if (g_memory_size < (1u << 20) ||
+            (g_memory_size & (g_memory_size - 1u)) != 0) {
+            fprintf(stderr, "xbox_MemoryLayoutInit: guest RAM size %zu must be"
+                            " a power of two\n", g_memory_size);
+            return FALSE;
+        }
+        g_memory_base = guest_window_alloc(g_memory_size, 4096);
+        if (!g_memory_base) {
+            fprintf(stderr, "xbox_MemoryLayoutInit: could not allocate %zu KB"
+                            " of guest RAM\n", g_memory_size / 1024);
+            return FALSE;
+        }
+        g_xbox_ram_size = (uint32_t)g_memory_size;
+        fprintf(stderr, "  Guest RAM: %zu MB, software translated"
+                        " (no mmap on this host)\n",
+                g_memory_size / (1024 * 1024));
+    }
+#else
     g_mapping_handle = CreateFileMappingA(
         INVALID_HANDLE_VALUE,   /* page file backed */
         NULL,                   /* default security */
@@ -1413,6 +1577,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+#endif /* __SWITCH__ */
+
     if (!g_memory_base) {
         fprintf(stderr, "xbox_MemoryLayoutInit: failed to map base view (%zu KB)\n",
                 g_memory_size / 1024);
@@ -1435,7 +1601,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * assumes this window is sixty-four megabytes of writable memory; if it is
      * not, saying so here is worth far more than the crash it becomes later.
      */
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__SWITCH__)
     {
         struct sigaction sa, old_bus, old_segv;
         volatile size_t off;
@@ -1853,6 +2019,82 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #undef XBOX_VA
     }
 
+#if defined(__SWITCH__)
+    /*
+     * The console's windows above RAM, each its own allocation and recorded
+     * so that XBOX_PTR's slow path can find it: the contiguous / physical
+     * window at 0x80000000 with the fake kernel image inside it, the NV2A
+     * register aperture at 0xFD000000, the MCPX southbridge span at
+     * 0xFE800000 and flash at 0xFF000000.
+     *
+     * The reasoning for backing each one is in the non-Switch branch below
+     * and is unchanged; only the host side of the address is. The order the
+     * windows are recorded in is the order they are searched, so the 4 KB
+     * kernel page goes in before the 64 MB window that contains it.
+     */
+    {
+        #define XBOX_KERNEL_BASE 0x80010000u
+        #define KERNEL_PAGE_SIZE 4096
+
+        g_contig_memory = guest_window_alloc(XBOX_CONTIG_SIZE, 4096);
+        g_kernel_memory = guest_window_alloc(KERNEL_PAGE_SIZE, 4096);
+        g_nv2a_memory   = guest_window_alloc(XBOX_NV2A_SIZE, 4096);
+        g_mcpx_memory   = guest_window_alloc(XBOX_MCPX_SIZE, 4096);
+        g_flash_memory  = guest_window_alloc(XBOX_FLASH_SIZE, 4096);
+
+        if (g_kernel_memory) {
+            /* e_lfanew = 0x80 with the rest zeroed: NumberOfSections reads as
+             * 0 and the cache-sizing search finds no INIT section, which is
+             * the path that skips it safely. */
+            *(uint32_t *)((uint8_t *)g_kernel_memory + 0x3C) = 0x80;
+            guest_window_add(XBOX_KERNEL_BASE, KERNEL_PAGE_SIZE,
+                             g_kernel_memory);
+        }
+        if (g_contig_memory)
+            guest_window_add(XBOX_CONTIG_BASE, XBOX_CONTIG_SIZE,
+                             g_contig_memory);
+        if (g_nv2a_memory) {
+            guest_window_add(XBOX_NV2A_BASE, XBOX_NV2A_SIZE, g_nv2a_memory);
+            /* The pushbuffer executor is the GPU here, and it is the ack
+             * thread that runs it; without it D3D's KickOff spins on a flush
+             * bit nobody clears. */
+            xbox_Nv2aAckStart();
+        }
+        if (g_mcpx_memory) {
+            guest_window_add(XBOX_MCPX_BASE, XBOX_MCPX_SIZE, g_mcpx_memory);
+            g_mcpx_regs = g_mcpx_memory;
+            /* AC'97 codec ready. The device registers are reached through
+             * recomp_mmio_read/write on this host (there is no fault-based
+             * decoder to route them), so the ready bit is simply written
+             * once: DirectSound resets the codec and then polls for it a
+             * thousand times, and a zeroed register makes it return
+             * DSERR_NODRIVER -- which some titles turn into a null engine
+             * object rather than a missing sound. */
+            if (getenv("RECOMP_AC97_READY_NOTRAP")) {
+                #define MCPX_AC97_CODEC_STATUS 0x00400130u
+                #define MCPX_AC97_CODEC_READY  0x00000100u
+                *(volatile uint32_t *)((char *)g_mcpx_memory
+                                       + MCPX_AC97_CODEC_STATUS)
+                    |= MCPX_AC97_CODEC_READY;
+                fprintf(stderr, "  AC97: codec reported ready (no MMIO trap)\n");
+                #undef MCPX_AC97_CODEC_STATUS
+                #undef MCPX_AC97_CODEC_READY
+            }
+        }
+        if (g_flash_memory)
+            guest_window_add(XBOX_FLASH_BASE, XBOX_FLASH_SIZE, g_flash_memory);
+
+        fprintf(stderr, "  Windows: contig %s, kernel %s, NV2A %s, MCPX %s,"
+                        " flash %s\n",
+                g_contig_memory ? "ok" : "FAILED",
+                g_kernel_memory ? "ok" : "FAILED",
+                g_nv2a_memory   ? "ok" : "FAILED",
+                g_mcpx_memory   ? "ok" : "FAILED",
+                g_flash_memory  ? "ok" : "FAILED");
+        #undef XBOX_KERNEL_BASE
+        #undef KERNEL_PAGE_SIZE
+    }
+#else
     /*
      * Contiguous / physical memory window at 0x80000000.
      *
@@ -1916,11 +2158,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE
         );
-        /* The pushbuffer survey rides on the same poll, so either
-         * variable arms it. */
-        s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
-                    || getenv("RECOMP_PB_SCAN") != NULL
-                    || getenv("RECOMP_PB_EXEC") != NULL;
+        /* The pushbuffer survey rides on the same poll; the switches live in
+         * xbox_Nv2aAckStart(), which both hosts reach. Reading them here left
+         * the Switch without a trace flag at all -- RECOMP_PB_EXEC was set but
+         * never consulted, so the ack thread never ran the executor and D3D
+         * spun in MakeSpace on a GET the GPU had no way to write. */
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
@@ -2097,12 +2339,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #undef XBOX_KERNEL_BASE
         #undef KERNEL_PAGE_SIZE
     }
+#endif /* __SWITCH__ */
 
     /* Initialize the dynamic heap. */
     fprintf(stderr, "  Heap: %u MB at Xbox VA 0x%08X-0x%08X\n",
             (unsigned)((XBOX_HEAP_TOP - XBOX_HEAP_BASE) / (1024 * 1024)),
             XBOX_HEAP_BASE, XBOX_HEAP_TOP);
 
+#if !defined(__SWITCH__)
     /*
      * Map mirror views of the 64 MB region.
      *
@@ -2221,6 +2465,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     XBOX_TILED_BASE, GetLastError());
         }
     }
+
+#endif /* !__SWITCH__ */
 
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;

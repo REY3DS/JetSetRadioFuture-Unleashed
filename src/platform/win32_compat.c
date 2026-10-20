@@ -26,9 +26,14 @@
 #include <time.h>
 #include <errno.h>
 #include <unistd.h>
+#if defined(__SWITCH__)
+#include <malloc.h>      /* memalign */
+#endif
 #include <sched.h>
 #include <fenv.h>
+#if !defined(__SWITCH__)
 #include <sys/mman.h>
+#endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -36,6 +41,10 @@
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#elif defined(__SWITCH__)
+/* newlib has no sys/sysinfo.h; GlobalMemoryStatusEx answers for itself below.
+ * No sys/syscall.h either, and no memfd_create: the file-mapping helper below
+ * declines rather than pretending. */
 #else
 #include <sys/sysinfo.h>
 #if defined(__ANDROID__)
@@ -1028,6 +1037,12 @@ static void w32_suspend_signal(int sig)
 
 static void w32_suspend_signal_install(void)
 {
+#if defined(__SWITCH__)
+    /* The console's kernel does not deliver signals to a thread, and newlib
+     * has no sigaction() to install one with. The cooperative checkpoint
+     * above is the whole of this host's suspend. */
+    return;
+#else
     static int done;
     struct sigaction sa;
     if (done) return;
@@ -1037,6 +1052,7 @@ static void w32_suspend_signal_install(void)
     sa.sa_flags = SA_RESTART;
     sigemptyset(&sa.sa_mask);
     sigaction(W32_SUSPEND_SIGNAL, &sa, NULL);
+#endif /* __SWITCH__ */
 }
 
 int w32_suspend_pending(void)
@@ -1176,7 +1192,9 @@ DWORD SuspendThread(HANDLE h)
       if (real < 0) real = getenv("RECOMP_SUSPEND_REAL") ? 1 : 0;
       if (real) {
           w32_suspend_signal_install();
+#if !defined(__SWITCH__)
           if (o->thread) pthread_kill(o->thread, W32_SUSPEND_SIGNAL);
+#endif
       } }
     handoff_note('s', o->tid, (int)prev + 1);
     return prev;
@@ -1186,9 +1204,9 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = obj_any(h);
     if (!o || o->kind != K_THREAD) return FALSE;
-#if defined(__ANDROID__)
-    /* Android has no pthread_cancel: the thread is marked ended and left to
-     * run to its own end. */
+#if defined(__ANDROID__) || defined(__SWITCH__)
+    /* Neither bionic nor libnx has pthread_cancel: the thread is marked ended
+     * and left to run to its own end. */
 #else
     pthread_cancel(o->thread);
 #endif
@@ -1397,6 +1415,7 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
  * host for it costs something: Apple Silicon refuses writable-and-executable
  * pages outside MAP_JIT, and iOS refuses executable pages to an app at all,
  * so a title committing memory PAGE_EXECUTE_READWRITE would get none. */
+#if !defined(__SWITCH__)
 static int prot_from_page(DWORD protect)
 {
     switch (protect & 0xFF) {
@@ -1409,6 +1428,7 @@ static int prot_from_page(DWORD protect)
     default:                     return PROT_READ | PROT_WRITE;
     }
 }
+#endif /* !__SWITCH__ */
 
 /* ---- the guest address reservation -------------------------------------- */
 
@@ -1448,6 +1468,13 @@ static int inside_reservation(const void *addr, size_t len)
 
 void *win32_reserve_address_space(void *base, size_t size)
 {
+#if defined(__SWITCH__)
+    /* Nothing to reserve: there is no mmap here, and the memory layout
+     * allocates its own windows and lets the translation find them. Saying so
+     * costs the caller nothing -- it falls back to asking per window. */
+    (void)base; (void)size;
+    return NULL;
+#else
     void *p;
     if (g_reserved_n >= W32_MAX_RESERVATIONS) return NULL;
     p = mmap(base, size, PROT_NONE,
@@ -1458,6 +1485,7 @@ void *win32_reserve_address_space(void *base, size_t size)
     g_reserved[g_reserved_n].size = size;
     g_reserved_n++;
     return p;
+#endif /* __SWITCH__ */
 }
 
 /* ---- host page granularity ----------------------------------------------
@@ -1502,6 +1530,15 @@ static size_t w32_host_page_size(void)
  * has to depend on the direction of the change, which is what this does. */
 static int protect_within_host_pages(void *addr, size_t size, int prot)
 {
+#if defined(__SWITCH__)
+    /* No mprotect, so a protection cannot be applied or refused. Every caller
+     * in this runtime is asking for access it already has -- the layout gives
+     * its windows out read-write, and the one that asks to take access away is
+     * a Windows fault-trap with no counterpart here. Reporting success is what
+     * keeps those callers on the path they expect. */
+    (void)addr; (void)size; (void)prot;
+    return 0;
+#else
     size_t ps = w32_host_page_size();
     uintptr_t a = (uintptr_t)addr, lo, hi;
     int grants = (prot & (PROT_READ | PROT_WRITE)) != 0;
@@ -1515,8 +1552,46 @@ static int protect_within_host_pages(void *addr, size_t size, int prot)
         if (hi <= lo) return 0;    /* finer than the host can express: skip */
     }
     return mprotect((void *)lo, (size_t)(hi - lo), prot);
+#endif /* __SWITCH__ */
 }
 
+#if defined(__SWITCH__)
+/*
+ * The Win32 virtual-memory API, as far as this host can mean it.
+ *
+ * There is no mmap and no mprotect, so nothing here maps or protects: the
+ * guest address space is translated (xbox_memory_layout.c) and the windows it
+ * hands out are ordinary heap. An allocation without an address is therefore
+ * an ordinary heap allocation -- that is what the device bridges want, and
+ * they hand the result straight back to the title as guest memory -- and one
+ * with an address is a caller saying "this range is already mine", which for
+ * every caller in this runtime it is: the layout's own windows, or a guest
+ * page inside RAM. Both are answered with what was asked for.
+ *
+ * Nothing is unmapped mid-flight: freeing guest memory the title still holds a
+ * pointer into is a bug on the console too, and one this host has no way to
+ * turn into a fault after the fact.
+ */
+LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
+{
+    (void)allocationType; (void)protect;
+    if (address) return address;
+    return _aligned_malloc(size ? size : 1, 4096);
+}
+
+BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
+{
+    (void)address; (void)size; (void)freeType;
+    return TRUE;
+}
+
+BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
+{
+    (void)address; (void)size; (void)newProtect;
+    if (oldProtect) *oldProtect = PAGE_READWRITE;
+    return TRUE;
+}
+#else
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
@@ -1578,6 +1653,7 @@ BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldPro
     return protect_within_host_pages(address, size,
                                      prot_from_page(newProtect)) == 0;
 }
+#endif /* __SWITCH__ */
 
 /* ===================================================================== */
 /* Time                                                                  */
@@ -1685,7 +1761,7 @@ VOID DebugBreak(void) {
 
 VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
-#if defined(__APPLE__) || defined(__ANDROID__)
+#if defined(__APPLE__) || defined(__ANDROID__) || defined(__SWITCH__)
     /* Darwin's memset_s is only declared when __STDC_WANT_LIB_EXT1__ is set
      * before every string.h in the translation unit, which is not something a
      * compat header can promise; Android's bionic has no explicit_bzero (and
@@ -1996,6 +2072,12 @@ static int anon_map_fd(const char *name)
             return fd;
         }
     }
+#elif defined(__SWITCH__)
+    /* No memfd_create, no shm_open, and nothing here needs a mapping anyway:
+     * the views this backs are the other hosts' way of aliasing the guest
+     * layout, which on this one is translation. Declined rather than faked. */
+    (void)name;
+    return -1;
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
@@ -2032,6 +2114,12 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
+#if defined(__SWITCH__)
+    (void)mapping; (void)access; (void)offHigh; (void)offLow;
+    (void)count; (void)baseAddr;
+    SetLastError(ERROR_INVALID_ADDRESS);
+    return NULL;
+#else
     w32_object *o = (w32_object *)mapping;
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
@@ -2063,6 +2151,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     }
     view_register(p, len);
     return p;
+#endif /* __SWITCH__ */
 }
 
 LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, SIZE_T count)
@@ -2072,9 +2161,14 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, 
 
 BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
+#if defined(__SWITCH__)
+    (void)baseAddr;
+    return FALSE;      /* nothing was ever mapped; see MapViewOfFileEx */
+#else
     size_t len = view_take(baseAddr);
     if (len == 0) return FALSE;
     return munmap((void *)baseAddr, len) == 0;
+#endif
 }
 
 /* ===================================================================== */
@@ -2126,6 +2220,15 @@ BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
         b->ullTotalPageFile = b->ullTotalPhys;
         b->ullAvailPageFile = b->ullAvailPhys;
     }
+#elif defined(__SWITCH__)
+    /* No sysinfo(2) in newlib. The console has 4 GB of DRAM shared with the
+     * GPU and an application is given a little over three of it; a title
+     * asking how much room there is gets the shape of that answer. */
+    if (!b) return FALSE;
+    b->ullTotalPhys     = 4ULL << 30;
+    b->ullAvailPhys     = 2ULL << 30;
+    b->ullTotalPageFile = b->ullTotalPhys;
+    b->ullAvailPageFile = b->ullAvailPhys;
 #else
     struct sysinfo si;
     if (!b) return FALSE;
@@ -2155,12 +2258,40 @@ void *_aligned_malloc(SIZE_T size, SIZE_T alignment)
     /* round alignment up to a power of two */
     SIZE_T a = sizeof(void *);
     while (a < alignment) a <<= 1;
+#if defined(__SWITCH__)
+    /* newlib has memalign, and no posix_memalign to link against. */
+    return memalign(a, size ? size : 1);
+#else
     void *p = NULL;
     if (posix_memalign(&p, a, size ? size : 1) != 0) return NULL;
     return p;
+#endif
 }
 
 void _aligned_free(void *ptr) { free(ptr); }
+
+#if defined(__SWITCH__)
+/*
+ * newlib declares neither pread nor pwrite.
+ *
+ * Both are a seek and the obvious half of the I/O, which is what they are on
+ * a host without threads sharing the descriptor. The runtime's writers are the
+ * save-file path and the page images the manual overrides keep, each with its
+ * own descriptor, so the atomicity a real pread/pwrite exists to provide is
+ * not being relied on here.
+ */
+ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
+{
+    if (lseek(fd, off, SEEK_SET) < 0) return -1;
+    return write(fd, buf, n);
+}
+
+ssize_t pread(int fd, void *buf, size_t n, off_t off)
+{
+    if (lseek(fd, off, SEEK_SET) < 0) return -1;
+    return read(fd, buf, n);
+}
+#endif
 
 /* ===================================================================== */
 /* Case-insensitive string compare                                        */
@@ -2208,6 +2339,29 @@ WCHAR *xbox_wcscpy(WCHAR *dst, const WCHAR *src)
 /* ===================================================================== */
 /* Time conversion                                                        */
 /* ===================================================================== */
+
+#if defined(__SWITCH__)
+/* newlib declares no timegm. This is the inverse of gmtime_r in UTC, by
+ * Howard Hinnant's days_from_civil, which needs no leap-second table. */
+static time_t w32_timegm(struct tm *tm)
+{
+    long long y = tm->tm_year + 1900LL;
+    long long m = tm->tm_mon + 1;
+    long long d = tm->tm_mday;
+    long long era, yoe, doy, doe, days;
+
+    y -= (m <= 2);
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = y - era * 400;
+    doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    days = era * 146097LL + doe - 719468LL;
+
+    return (time_t)(days * 86400LL + tm->tm_hour * 3600LL
+                    + tm->tm_min * 60LL + tm->tm_sec);
+}
+#define timegm(t) w32_timegm(t)
+#endif
 
 BOOL SystemTimeToFileTime(const SYSTEMTIME *st, LPFILETIME ft)
 {
@@ -2293,8 +2447,24 @@ BOOL InitOnceExecuteOnce(PINIT_ONCE o, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx
 
 BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
 {
-    DWORD hi = 0, lo = GetFileSize(h, &hi);
-    if (lo == 0xFFFFFFFFu && GetLastError() != 0) return FALSE;
-    size->QuadPart = ((LONGLONG)hi << 32) | lo;
+#if defined(__SWITCH__)
+    /* A partition image on the Switch is only as long as the title has
+     * written (see posix_create_partition_images in kernel_path.c), so the
+     * file's own size is not the partition's size.  The caller is
+     * IOCTL_DISK_GET_PARTITION_INFO, which is how the title finds out how big
+     * the cache partition is: answered 0, it closes the volume and goes back
+     * to the firmware. */
+    {
+        extern unsigned long long xbox_partition_image_size(const char *host_path);
+        const char *hp = w32_handle_path(h);
+        unsigned long long psz = hp ? xbox_partition_image_size(hp) : 0;
+        if (psz && size) { size->QuadPart = (LONGLONG)psz; return TRUE; }
+    }
+#endif
+    {
+        DWORD hi = 0, lo = GetFileSize(h, &hi);
+        if (lo == 0xFFFFFFFFu && GetLastError() != 0) return FALSE;
+        size->QuadPart = ((LONGLONG)hi << 32) | lo;
+    }
     return TRUE;
 }

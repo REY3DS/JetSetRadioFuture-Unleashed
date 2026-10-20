@@ -122,6 +122,9 @@ extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 extern ptrdiff_t g_xbox_mem_offset;
+#if defined(__SWITCH__)
+void *xbox_HostPtr(uint32_t guest_va);
+#endif
 
 /* ── XBE Constants ─────────────────────────────────────────── */
 
@@ -159,10 +162,11 @@ static int g_scale_env_ours;
 void recomp_restart_self(void);
 void recomp_restart_self(void)
 {
-#if defined(__ANDROID__)
-    /* Android: the process is the app's, not a program that can exec itself.
-     * A choice made in game (F9) is stored, and applies at the next start. */
-    fprintf(stderr, "  [WIN] restart: not on Android -- the choice applies at the next start\n");
+#if defined(__ANDROID__) || defined(__SWITCH__)
+    /* Android and the Switch: the process is the app's (or libnx's), not a
+     * program that can exec itself -- newlib here has no execv at all. A
+     * choice made in game is stored, and applies at the next start. */
+    fprintf(stderr, "  [WIN] restart: cannot exec on this host -- the choice applies at the next start\n");
     return;
 #endif
     if (!g_argv || !g_argv[0]) return;
@@ -287,10 +291,15 @@ static uint32_t jsrf_apu_mmio_read(uint32_t addr, unsigned size)
     /* The USB host controllers, at the top of the same aperture. */
     if (addr >= 0xFED00000u && addr < 0xFED09000u && xbox_OhciEnabled())
         return xbox_OhciRead(addr, (int)size);
+    /* Anything that fell through the two models above still lives in the
+     * MCPX window, not in RAM: on a host that maps the whole guest address
+     * space the offset works for both, but on the Switch it is the RAM base,
+     * and the AC'97 bus master at 0xFEC0012C translated to "RAM base +
+     * 0xFEC0012C" -- four gigabytes past the allocation. */
     switch (size) {
-    case 1:  return *(volatile uint8_t *)((uintptr_t)addr + g_xbox_mem_offset);
-    case 2:  return *(volatile uint16_t *)((uintptr_t)addr + g_xbox_mem_offset);
-    default: return *(volatile uint32_t *)((uintptr_t)addr + g_xbox_mem_offset);
+    case 1:  return *(volatile uint8_t *)xbox_HostPtr(addr);
+    case 2:  return *(volatile uint16_t *)xbox_HostPtr(addr);
+    default: return *(volatile uint32_t *)xbox_HostPtr(addr);
     }
 }
 static void jsrf_apu_mmio_write(uint32_t addr, uint32_t val, unsigned size)
@@ -308,7 +317,7 @@ static void jsrf_apu_mmio_write(uint32_t addr, uint32_t val, unsigned size)
      * channel control register self-clears on hardware, and DirectSound
      * spins on a register copy it read right after writing it. */
     if (addr >= 0xFEC00100u && addr < 0xFEC00200u && size == 1 && (val & 2))
-        *(volatile uint8_t *)((uintptr_t)addr + g_xbox_mem_offset) = (uint8_t)(val & ~2u);
+        *(volatile uint8_t *)xbox_HostPtr(addr) = (uint8_t)(val & ~2u);
 }
 
 static void term_handler(int sig)
@@ -324,12 +333,17 @@ static void term_handler(int sig)
  * jsrf_protect_data_arm() (called from a file-open hook); each fault logs,
  * unprotects that page and resumes. POSIX only: on Windows the switch says
  * so and does nothing. */
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__SWITCH__)
 void jsrf_protect_data_arm(void)
 {
+    /* Write-protecting guest pages is a host trick, and this host has neither
+     * mprotect nor a fault decoder to catch what it would trap. Said out loud
+     * rather than silently ignored, because a run with JSRF_PROTECT_DATA set
+     * and no output would otherwise look like a title that never writes. */
     static int said;
     if (getenv("JSRF_PROTECT_DATA") && !said++)
-        fprintf(stderr, "[PROTECT] JSRF_PROTECT_DATA is not available on Windows\n");
+        fprintf(stderr, "[PROTECT] JSRF_PROTECT_DATA needs mprotect; not"
+                        " available on this host\n");
 }
 #else
 #include <sys/mman.h>
@@ -445,7 +459,18 @@ static void report_bad_pointer(uintptr_t fault_addr)
     }
 }
 
-#if !defined(_WIN32)
+#if defined(__SWITCH__)
+/*
+ * No crash handler on the Switch.
+ *
+ * Everything in this branch is built on signals: the console's kernel does not
+ * deliver them to a thread, newlib has no sigaction() to install one with, and
+ * there is no <ucontext.h> to read a fault's registers out of. A fault stops
+ * the process and the console shows its own message; the run's log, written
+ * and flushed as it goes, is what is left to read -- which is why the harness
+ * keeps one.
+ */
+#elif !defined(_WIN32)
 /*
  * The faulting instruction pointer and stack pointer, whatever the host is.
  *
@@ -701,6 +726,10 @@ static int host_main(void)
          * unless asked: a frame paced at 60 Hz would come out at 32 ms. One
          * millisecond, as a POSIX host's sleeps are. */
         timeBeginPeriod(1);
+#elif defined(__SWITCH__)
+        /* Nothing to install -- see the note where the POSIX handlers would
+         * have been. The term handler below is newlib's signal(), which is
+         * what the harness's own exit path uses. */
 #else
         struct sigaction sa; memset(&sa, 0, sizeof sa);
         sa.sa_sigaction = segv_handler; sa.sa_flags = SA_SIGINFO;
@@ -826,7 +855,13 @@ static int host_main(void)
          * VA 0 made every voice-list read come back empty and every CBO
          * write-back land in the title's heap -- the scene graph corrupted
          * the moment the title music started. */
+#if defined(__SWITCH__)
+        /* Same window, different host side: above 64 MB the guest
+         * address is no longer an offset from RAM. */
+        g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_HostPtr(0x80000000u));
+#else
         g_apu_state = mcpx_apu_init_standalone((uint8_t *)(g_xbox_mem_offset + 0x80000000u));
+#endif
         /* Route the APU register window (main regs + voice processor) to
          * the emulation; the lifted code's memory macros call these for
          * any access in [RECOMP_MMIO_LO, RECOMP_MMIO_HI). Without it the
@@ -849,6 +884,12 @@ static int host_main(void)
      * what a run showed: the guest read the pad zero times in seventy
      * seconds. RECOMP_USB=1 turns it on. */
     xbox_OhciInit();
+
+    /* Arm the hang watchdog here, not during setup: it samples the guest
+     * registers through thread-local pointers, so it has to be handed the
+     * ones belonging to the thread that is about to run the title. It does
+     * nothing unless RECOMP_WATCHDOG_SECS is set. */
+    xbox_WatchdogStart();
 
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");

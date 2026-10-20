@@ -220,6 +220,17 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+
+/* Guest VA -> host pointer (see xbox_memory_layout.c). Identical to
+ * XBOX_PTR on the hosts that map the guest linearly; on the Switch it is
+ * the same translation the macro uses. */
+void *xbox_HostPtr(uint32_t guest_va);
+#if defined(__SWITCH__)
+/* Is this guest range backed by host memory? RAM, the contiguous block, the
+ * device windows and the tiled aperture all are; an arbitrary address is not.
+ * Switch only: the other hosts answer it with the mapping size. */
+int xbox_GuestRangeMapped(uint32_t va, uint32_t bytes);
+#endif
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);

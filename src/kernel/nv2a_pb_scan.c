@@ -27,6 +27,16 @@
 #include <string.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+/* A pushbuffer word. The ack thread hands this the contiguous-window
+ * form of DMA_PUT (0x80000000 | physical), which on the Switch is a
+ * separate allocation rather than an offset from RAM: adding it to the
+ * RAM base read two gigabytes past the end of the heap. */
+void *xbox_HostPtr(uint32_t guest_va);
+
+static inline uint32_t pb_word(uint32_t va)
+{
+    return *(const uint32_t *)xbox_HostPtr(va);
+}
 
 #define PB_MAX_METHODS 4096
 
@@ -182,7 +192,6 @@ static uint32_t pb_walk_sub(uint32_t target_va);
 
 uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t va = start_va;
     uint32_t words = 0, jumps = 0, unknown = 0, jump_to = 0;
 
@@ -212,7 +221,7 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         end_va = start_va + 0x400000u;
 
     while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        uint32_t w = pb_word(va);
         va += 4;
         words++;
 
@@ -264,8 +273,7 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
                 if (s_exec_enabled)
-                    nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
+                    nv2a_pb_exec_method(subch, m, pb_word(va));
                 va += 4;
                 words++;
             }

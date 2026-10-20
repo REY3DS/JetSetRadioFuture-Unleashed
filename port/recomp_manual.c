@@ -36,6 +36,15 @@ static long long jsrf_pwrite(int fd, const void *buf, size_t n, long long off)
     return _write(fd, buf, (unsigned)n);
 }
 #define pwrite jsrf_pwrite
+#elif defined(__SWITCH__)
+/* newlib declares neither pwrite nor pread, and the one writer here only ever
+ * appends a page image, so a seek and a write are the same thing. */
+static long long jsrf_pwrite(int fd, const void *buf, size_t n, long long off)
+{
+    if (lseek(fd, (off_t)off, SEEK_SET) < 0) return -1;
+    return (long long)write(fd, buf, n);
+}
+#define pwrite jsrf_pwrite
 #endif
 
 /* The Win32 shim's thread id, so traces here and the kernel's [WAITLOG]
@@ -72,6 +81,9 @@ typedef void (*recomp_func_t)(void);
 
 #include "recomp/gen/recomp_types.h"
 extern ptrdiff_t g_xbox_mem_offset;
+/* Guest VA -> host pointer. Same addition as g_xbox_mem_offset on the hosts
+ * that map the console's address space; the window table on the Switch. */
+void *xbox_HostPtr(uint32_t guest_va);
 
 /* ── Manual function overrides ─────────────────────────────── */
 
@@ -2062,9 +2074,10 @@ extern void sub_00194210_gen(void);
 extern void xbox_nv2a_software_method_done(void);
 void sub_00194210(void)
 {
-    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
-    volatile uint32_t *intr = (volatile uint32_t *)(m + 0xFD400100u);
-    volatile uint32_t *pmc  = (volatile uint32_t *)(m + 0xFD000100u);
+    /* NV2A registers, not RAM: "RAM base + 0xFD400100" is four gigabytes past
+     * the allocation on the Switch, where every device window is its own. */
+    volatile uint32_t *intr = (volatile uint32_t *)xbox_HostPtr(0xFD400100u);
+    volatile uint32_t *pmc  = (volatile uint32_t *)xbox_HostPtr(0xFD000100u);
     uint32_t seen = *intr;
     sub_00194210_gen();
     *intr &= ~seen;
@@ -2419,15 +2432,38 @@ extern void mcpx_apu_dsp_ack_add(uint32_t addr);
 void sub_001A1769(void)
 {
     static uint32_t registered;
-    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
-    uint32_t p = g_ecx;
+    static int said_zero;
+    uint32_t this_ptr = g_ecx;
+    uint32_t p = this_ptr;
 
-    if (p) p = *(const uint32_t *)(m + p + 8);
-    if (p) p = *(const uint32_t *)(m + p + 0x10);
-    if (p) p = *(const uint32_t *)(m + p);
+    /* Through xbox_HostPtr, not through "RAM base + p".
+     *
+     * The block this chain ends at is a DMA allocation, and on a host where
+     * the guest address space is not one flat mapping -- the Switch -- a
+     * physical or contiguous address is not an offset from the RAM base.
+     * Translated the old way some link of the chain read outside the
+     * allocation, p came back zero, the doorbell was never registered, and
+     * the spin at 0x001A18D0 ("cmp [ebx], 0 / jne") never ended: the audio
+     * thread held the guest lock for ever and the title never reached its
+     * first frame. The lifted code reads the same pointers through MEM32,
+     * which does translate, so it spun on the real doorbell word while this
+     * wrapper was looking at nothing.
+     *
+     * xbox_HostPtr is exactly g_xbox_mem_offset + va on the hosts, so this
+     * changes nothing there. */
+    if (p) p = *(const uint32_t *)xbox_HostPtr(p + 8);
+    if (p) p = *(const uint32_t *)xbox_HostPtr(p + 0x10);
+    if (p) p = *(const uint32_t *)xbox_HostPtr(p);
     if (p && p != registered) {
         registered = p;
+        fprintf(stderr, "[APU] DSP doorbell: this=0x%08X block=0x%08X"
+                        " doorbell=0x%08X\n",
+                this_ptr, p, (p + 0x810) & 0x0FFFFFFFu);
         mcpx_apu_dsp_ack_add(p + 0x810);
+    } else if (!p && !said_zero) {
+        said_zero = 1;
+        fprintf(stderr, "[APU] DSP doorbell: this=0x%08X, chain gave 0\n",
+                this_ptr);
     }
     sub_001A1769_gen();
 }

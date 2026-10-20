@@ -200,7 +200,10 @@ if(SWITCH)
                 "Jet Set Radio Future Unleashed" "jsrf" "${JSRF_VERSION}" "${_jsrf_nacp}"
         COMMAND "${NX_ELF2NRO_EXE}" "$<TARGET_FILE:jsrf_recomp>"
                 "${CMAKE_CURRENT_BINARY_DIR}/jsrf_recomp.nro"
-                --nacp="${_jsrf_nacp}" --icon="${NX_DEFAULT_ICON}"
+                --nacp=${_jsrf_nacp} --icon=${NX_DEFAULT_ICON}
+        # NB: no quotes around the values above. VERBATIM already quotes
+        # each argument for the shell; adding them here makes elf2nro
+        # receive the quotes as part of the file name and fail to open it.
         COMMENT "Packing jsrf_recomp.nro"
         VERBATIM)
 endif()
