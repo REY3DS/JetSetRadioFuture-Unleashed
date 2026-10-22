@@ -2161,10 +2161,22 @@ static void surface_bind(uint32_t offset, uint32_t w, uint32_t h)
      * all of it, so a black start can only remove content that was about to
      * be replaced. Once per present, and only for the target that was just
      * shown. RECOMP_GL_CLEAR_BEFORE_COPY=0 turns it off. */
-    /* The clear is not done here any more. It is done at the flip, because
-     * this title screen binds its surface once and then draws hundreds of
-     * frames into it; a clear on the bind fires once and every frame after
-     * it stays under the next. See the end of M_FLIP_STALL. */
+    if (g_cur_rt && g_cur_rt == g_last_presented_rt && g_present_clear_pending) {
+        static int on = -1;
+        if (on < 0) { const char *e = getenv("RECOMP_GL_CLEAR_BEFORE_COPY");
+                      on = e ? atoi(e) : 1; }
+        g_present_clear_pending = 0;
+        if (on) {
+            static int said;
+            float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            if (!said++)
+                fprintf(stderr, "  [GL] display buffer rt %u is not cleared by"
+                                " the title; clearing it before the copy\n",
+                        g_cur_rt);
+            G->clear(1u, black, 0.0f, 0u, NULL);
+            g_cleared_by_us_rt = g_cur_rt;
+        }
+    }
     g_surf_lost = 0;
     g_fbo_w = w; g_fbo_h = h;
     g_fbo_pw = w * gl_scale(); g_fbo_ph = h * gl_scale();
@@ -9878,7 +9890,6 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * about to scan out is the other one -- same size and format, and
          * drawn since the last flip. If there is no such buffer (a title
          * that draws straight into its back buffer), the bound one it is. */
-        int flip_rt = -1;
         { int k, m = -1, best = -1;
           for (k = 0; k < SURF_CACHE; k++)
               if (g_surf[k].used && g_surf[k].offset == S.color_offset
@@ -9917,7 +9928,6 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
                           g_surf[m].rt);
           }
           else g_present_slot = m;
-          if (m >= 0) flip_rt = (int)g_surf[m].rt;
           g_last_flip_draws = S.draws; }
         if (S.since_present) { fliplog("flip_stall"); present(1); }
         else {
@@ -9940,37 +9950,6 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
             fliplog("stall(nodraw)");
             if (pace_nodraw) frame_pace();
         }
-        /* Blank the surface the title has bound for the next frame.
-         *
-         * It has just been presented (a title that draws into one surface) or
-         * holds a frame older than the one on screen (a title that alternates
-         * two), so its contents are worth nothing either way, and the title is
-         * about to overwrite all of it.
-         *
-         * At the flip, not on the bind. The title screen binds its one surface
-         * and then draws hundreds of frames into it without binding again, so
-         * a clear on the bind fired once and every frame after it stayed under
-         * the next: the ghost menu in the screenshot, "New Game" five times at
-         * five alphas, on a background that should be solid.
-         *
-         * The hold above keeps this honest -- a surface blanked here is not
-         * handed to the window until something has been drawn into it -- so
-         * this cannot reintroduce the black flicker. RECOMP_GL_CLEAR_BEFORE_COPY=0
-         * turns it off. */
-        { static int on = -1;
-          if (on < 0) { const char *e = getenv("RECOMP_GL_CLEAR_BEFORE_COPY");
-                        on = e ? atoi(e) : 1; }
-          if (on && flip_rt >= 0) {
-              static int said;
-              float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-              surface_bind(S.color_offset, S.clip_w, S.clip_h);
-              if (!said++)
-                  fprintf(stderr, "  [GL] clearing rt %d after the flip: the"
-                                  " title binds it once and never clears it\\n",
-                          flip_rt);
-              G->clear(1u, black, 0.0f, 0u, NULL);
-              g_cleared_by_us_rt = (uint32_t)flip_rt;
-          } }
         break;
     default:
         /* RECOMP_GL_UNHANDLED=1: every method this backend ignores, ranked.
