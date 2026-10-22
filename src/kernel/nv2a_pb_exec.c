@@ -1488,14 +1488,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (method == 0x1D6C) {
             /* A semaphore offset indexes the DMA object the driver gave us, so
              * it has to be an offset into the contiguous window the title owns
-             * -- four gigabytes of address space are not on offer. Refusing a
-             * value that is not is not a guess about the stream: it is the one
-             * address the fence cannot have. Measured on the Switch: a value
+             * -- four gigabytes of address space are not on offer, and the
+             * block the driver allocates for fences is small enough that the
+             * first 64 KB of its object covers it. Refusing a value outside
+             * that is not a guess about the stream: it is the one address the
+             * fence cannot have. Measured on the Switch: a value
              * of 0x1D4B1D49 (two 16-bit indices read as one) sent the release
              * to a wrapped address, the title's fence dword stayed at 0x5735
              * while it waited for 0x573F, and the loading screen stopped with
              * the ring's consume counter twelve dwords short. */
-            if ((param & 3u) == 0u && param + s_sem_base + 4u <= 0x04000000u) {
+            if ((param & 3u) == 0u && param + s_sem_base + 4u <= 0x00010000u) {
                 s_sem_offset = param;
             } else {
                 static int said;
@@ -1527,7 +1529,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     uint32_t off = s_sem_base + s_sem_offset;
                     /* Same rule at the release: inside the window, or the
                      * release answers a fence the title is not waiting on. */
-                    va = ((off & 3u) == 0u && off + 4u <= 0x04000000u)
+                    va = ((off & 3u) == 0u && off + 4u <= 0x00010000u)
                              ? (0x80000000u | off) : 0u;
                     if (!va) {
                         static int said;
