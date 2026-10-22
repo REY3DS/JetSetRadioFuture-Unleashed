@@ -370,6 +370,7 @@ static struct {
 
     /* stats */
     uint32_t draws, tris, clears, flips, prog_switches, since_present;
+    uint32_t present_uncleared;
     /* Displayed frames, as distinct from finished passes: see M_FLIP_STALL. */
     uint32_t frames;
     uint32_t tris_ff, tris_pm;   /* triangles by transform pipeline */
@@ -8342,6 +8343,11 @@ static void present(int is_frame);
  * times: the cap was counting passes. This says which is which. */
 static void fliplog(const char *why);
 
+/* The render targets cleared since the last present. Four is enough: a
+ * frame that clears more than four is not the case this is looking for. */
+static uint32_t s_cleared_rt[4];
+static int s_cleared_n;
+
 static void do_clear(uint32_t param)
 {
     unsigned mask = 0;
@@ -8440,6 +8446,7 @@ static void do_clear(uint32_t param)
     if (!g_surf_lost)
         G->clear(mask, rgba, depth, S.clear_zstencil & 0xFFu, rectp);
     S.clears++;
+    if (s_cleared_n < 4) s_cleared_rt[s_cleared_n++] = g_cur_rt;
 }
 
 /* Copy what GL drew into the title's own surface, so the rest of the runtime
@@ -8713,6 +8720,27 @@ static void present(int is_frame)
             pw = g_surf[g_present_slot].w * gl_scale();
             ph = g_surf[g_present_slot].h * gl_scale();
         }
+        /* Is the picture going to a target the title cleared this frame?
+         *
+         * Both halves are measured facts: the title clears about 1.2 times
+         * per present, and the frames still accumulate. The two are only
+         * consistent if the clear goes somewhere other than the target that
+         * is presented -- which is exactly what double buffering plus a
+         * present-slot choice can do. Reported rather than repaired: knowing
+         * which of the two it is decides whether the fix belongs in the slot
+         * bookkeeping or in the clear. */
+        { int k, hit = 0;
+          for (k = 0; k < s_cleared_n; k++)
+              if (s_cleared_rt[k] == prt) hit = 1;
+          if (!hit) {
+              S.present_uncleared++;
+              if (S.present_uncleared <= 8 || (S.present_uncleared % 500) == 0)
+                  fprintf(stderr, "  [GL] presenting rt %u, which was not cleared"
+                                  " this frame (cleared: %d target%s, rt %u..)\n",
+                          prt, s_cleared_n, s_cleared_n == 1 ? "" : "s",
+                          s_cleared_n ? s_cleared_rt[0] : 0u);
+          }
+          s_cleared_n = 0; }
 #if defined(NV2A_GL_USE_CGL)
         /* OpenGL on a Mac: read the finished frame and hand it to the window.
          *
