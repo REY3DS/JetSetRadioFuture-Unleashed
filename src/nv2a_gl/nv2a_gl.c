@@ -639,6 +639,10 @@ static struct {
 static uint32_t g_surf_clock;
 static int      g_dump_burst_left, g_dump_burst_every = 1;
 static int      g_present_slot = -1;  /* set at FLIP_STALL, see present() */
+/* The target that went on screen, and whether its next bind must start black.
+ * See the note in surface_bind(). */
+static uint32_t g_last_presented_rt;
+static int      g_present_clear_pending;
 static uint32_t g_last_flip_draws;    /* S.draws at the last FLIP_STALL */
 static int      g_cur_surf = -1;
 /* nv2a_gl_trace_frames(): per-pass log for the next few frames. */
@@ -2135,6 +2139,40 @@ static void surface_bind(uint32_t offset, uint32_t w, uint32_t h)
         g_cur_surf = slot;
     }
     g_cur_rt = g_surf[slot].rt;
+    /* A display buffer the title only ever overwrites.
+     *
+     * Presenting a target that was not cleared is correct here, and the first
+     * conclusion drawn from the counters was wrong: the title clears its
+     * off-screen frame (13,878 clears, all of them there) and then copies it
+     * into one of two display buffers. Those two get 1,601 and 1,602 draws
+     * over 8,808 presented frames -- one full-screen draw per new frame, and
+     * no clear at all.
+     *
+     * That only works if the copy REPLACES what is underneath it. When it
+     * blends, every new frame of the menu stays on the display buffer under
+     * the next one, which is the screenshot: "New Game" four times at four
+     * alphas, the logo twice, the cityscape at two scales.
+     *
+     * Clearing here is safe by construction. This is the point where the
+     * backend has just bound the target and the title is about to overwrite
+     * all of it, so a black start can only remove content that was about to
+     * be replaced. Once per present, and only for the target that was just
+     * shown. RECOMP_GL_CLEAR_BEFORE_COPY=0 turns it off. */
+    if (g_cur_rt && g_cur_rt == g_last_presented_rt && g_present_clear_pending) {
+        static int on = -1;
+        if (on < 0) { const char *e = getenv("RECOMP_GL_CLEAR_BEFORE_COPY");
+                      on = e ? atoi(e) : 1; }
+        g_present_clear_pending = 0;
+        if (on) {
+            static int said;
+            float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            if (!said++)
+                fprintf(stderr, "  [GL] display buffer rt %u is not cleared by"
+                                " the title; clearing it before the copy\n",
+                        g_cur_rt);
+            G->clear(1u, black, 0.0f, 0u, NULL);
+        }
+    }
     g_surf_lost = 0;
     g_fbo_w = w; g_fbo_h = h;
     g_fbo_pw = w * gl_scale(); g_fbo_ph = h * gl_scale();
@@ -8773,6 +8811,8 @@ static void present(int is_frame)
         /* The device's end of the frame: Metal shows it in the window's
          * layer, and either way the frame's work is handed to the GPU. */
         G->present(prt, pw, ph);
+        g_last_presented_rt = prt;
+        g_present_clear_pending = 1;
 #if defined(NV2A_GL_USE_CGL)
         if (g_windowed && nv_window_should_close()) {
             fprintf(stderr, "  [GL] window closed; stopping\n");
