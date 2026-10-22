@@ -199,6 +199,71 @@ void recomp_slice_check(void)
  * seconds, say so, with the words the guest stack carries. That is the same
  * shape the crash handler prints, so tools/stackwalk.py reads it too.
  */
+/* Where each thread last came round a loop, kept where another thread can
+ * read it.
+ *
+ * The [SPIN] report above is the thread's own account, and it only exists
+ * while the thread is running: one that took no back edge for a minute -- or
+ * that took one at a different stack depth each time, or that is queued for
+ * the guest lock and executing nothing at all -- leaves no trace there. A
+ * thread that has stopped asking the kernel for anything is exactly the one
+ * the other threads are waiting on, and "it has not come round a loop for N
+ * seconds" tells that apart from "it is looping somewhere". */
+#define SLICE_SLOTS 16
+typedef struct {
+    volatile unsigned long long tid;
+    volatile uint32_t va;
+    volatile uint32_t esp;
+    volatile long long ms;
+    volatile unsigned long long n;
+} SliceSeen;
+static SliceSeen g_slice_seen[SLICE_SLOTS];
+static RECOMP_TLS SliceSeen *t_slice_seen;
+
+static void slice_note(uint32_t va, uint32_t esp)
+{
+    unsigned long long tid = (unsigned long long)(uintptr_t)GetCurrentThreadId();
+    SliceSeen *s = t_slice_seen;
+    int i;
+
+    if (!s || s->tid != tid) {
+        s = NULL;
+        for (i = 0; i < SLICE_SLOTS; i++) {
+            if (g_slice_seen[i].tid == tid) { s = &g_slice_seen[i]; break; }
+            if (!g_slice_seen[i].tid) {
+                unsigned long long zero = 0;
+                if (__atomic_compare_exchange_n(&g_slice_seen[i].tid, &zero, tid,
+                                                0, __ATOMIC_RELAXED,
+                                                __ATOMIC_RELAXED)) {
+                    s = &g_slice_seen[i];
+                    break;
+                }
+                if (g_slice_seen[i].tid == tid) { s = &g_slice_seen[i]; break; }
+            }
+        }
+        if (!s) return;
+        t_slice_seen = s;
+    }
+    s->va = va;
+    s->esp = esp;
+    s->ms = (long long)GetTickCount64();
+    s->n++;
+}
+
+void recomp_slice_report(void)
+{
+    long long now = (long long)GetTickCount64();
+    int i;
+    fprintf(stderr, "  [SLICE] last back edge per thread:");
+    for (i = 0; i < SLICE_SLOTS; i++) {
+        if (!g_slice_seen[i].tid) continue;
+        fprintf(stderr, " %llu@%08X esp %08X age %lld n %llu |",
+                g_slice_seen[i].tid, g_slice_seen[i].va, g_slice_seen[i].esp,
+                now - g_slice_seen[i].ms, g_slice_seen[i].n);
+    }
+    fprintf(stderr, "\n");
+}
+
 void recomp_slice_site(uint32_t site_va)
 {
     static RECOMP_TLS uint32_t last_esp;
@@ -206,6 +271,10 @@ void recomp_slice_site(uint32_t site_va)
     extern void xbox_guest_lock_yield_now(void);
     uint32_t esp = g_esp;
     long long now = (long long)GetTickCount64();
+
+    slice_note(site_va, esp);
+
+    slice_note(site_va, esp);
 
     /* A loop usually comes back to more than one address, so it is the
      * stack pointer that says the loop is one loop. */
@@ -250,6 +319,8 @@ void recomp_slice_site(uint32_t site_va)
         }
         { extern void xbox_host_server_report(void);
           xbox_host_server_report(); }
+        { extern void nv2a_pb_state_line(void) __attribute__((weak));
+          if (nv2a_pb_state_line) nv2a_pb_state_line(); }
         {
             /* The NV2A register block, if a register holds it: say what the
              * words a handshake reads say, and what the model thinks of them.

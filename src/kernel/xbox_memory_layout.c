@@ -506,20 +506,8 @@ static void frame_counters_tick(void)
     }
 }
 
-static void fence_mirrors_tick(void)
+static void fence_mirrors_write(void)
 {
-    /* RECOMP_FENCE_MIRROR=0: leave the fence block to the pushbuffer
-     * executor, which writes BACK_END_WRITE_SEMAPHORE_RELEASE values into it
-     * when it reaches them. Mirroring PUT on top of that would answer every
-     * fence "done" before the work behind it had been read -- which is what
-     * let JSRF rewrite its dynamic buffers under the renderer. */
-    { static int on = -1;
-      if (on < 0) { const char *e = getenv("RECOMP_FENCE_MIRROR");
-                    /* Off by default whenever the executor is running: it
-                     * writes the real semaphores. On for a run without it,
-                     * where nothing else would ever complete a fence. */
-                    on = e ? atoi(e) : (getenv("RECOMP_PB_EXEC") ? 0 : 1); }
-      if (!on) return; }
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -540,19 +528,47 @@ static void fence_mirrors_tick(void)
             uint32_t put =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
-            /* RECOMP_PB_SEMLOG=1: where the block is and what is in it,
-             * so the semaphore offsets the executor logs can be matched
-             * against it. Once a second. */
-            { static int lg = -1; static DWORD last;
-              if (lg < 0) lg = getenv("RECOMP_PB_SEMLOG") ? 1 : 0;
-              if (lg && GetTickCount() - last > 1000) { int k; last = GetTickCount();
-                  fprintf(stderr, "  [SEM] fence block at VA 0x%08X (dev 0x%08X put 0x%08X):", get_ptr, dev, put);
-                  for (k = 0; k < 24; k++) fprintf(stderr, " %08X", fence[k]);
-                  fprintf(stderr, "\n"); fflush(stderr); } }
             if (*fence != put)
                 *fence = put;
         }
     }
+}
+
+/* The submit position goes into the ring's consume counter for a segment the
+ * executor read but could not decode to the end.
+ *
+ * This is not the fence mirror the header warns about. That one answers every
+ * fence the moment it is submitted, so the renderer ends up drawing from
+ * buffers the title has already rewritten. This is called only when a walk has
+ * stopped short of the segment's end and resynchronisation found no release
+ * packet in what was left -- the case measured on the Switch at 0x80011010,
+ * where four SET_TRANSFORM_PROGRAM packets are followed by index data with no
+ * command header, and the release the title waits on (0x57DF, 0x7177) is
+ * nowhere in the submitted bytes. Leaving the counter short of what the title
+ * asks for stops the machine at 0x001914F0 forever; releasing it lets the
+ * title submit again, and the next segment starts on a command boundary.
+ *
+ * Reported by the caller, so a segment that needs this is never silent. */
+void xbox_Nv2aReleaseStalledRing(void)
+{
+    fence_mirrors_write();
+}
+
+static void fence_mirrors_tick(void)
+{
+    /* RECOMP_FENCE_MIRROR=0: leave the fence block to the pushbuffer
+     * executor, which writes BACK_END_WRITE_SEMAPHORE_RELEASE values into it
+     * when it reaches them. Mirroring PUT on top of that would answer every
+     * fence "done" before the work behind it had been read -- which is what
+     * let JSRF rewrite its dynamic buffers under the renderer. */
+    { static int on = -1;
+      if (on < 0) { const char *e = getenv("RECOMP_FENCE_MIRROR");
+                    /* Off by default whenever the executor is running: it
+                     * writes the real semaphores. On for a run without it,
+                     * where nothing else would ever complete a fence. */
+                    on = e ? atoi(e) : (getenv("RECOMP_PB_EXEC") ? 0 : 1); }
+      if (!on) return; }
+    fence_mirrors_write();
 }
 
 static int s_nv2a_trace = 0;
@@ -824,9 +840,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
+                    int scanned = 0;
                     if (last_put && put > last_put) {
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                        scanned = 1;
                     } else if (last_put && put < last_put) {
                         /* The ring wrapped: PUT went back to its start.
                          * The tail from the old PUT to the jump used to be
@@ -836,10 +854,37 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                          * then from the jump's target to the new PUT. */
                         uint32_t from = XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu);
                         uint32_t to   = XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu);
-                        uint32_t j = nv2a_pb_scan(from, from + 0x20000u);
+                        extern uint32_t nv2a_pb_find_jump(uint32_t, uint32_t);
+                        uint32_t j = nv2a_pb_find_jump(from,
+                                     (from + 0x20000u < 0x84000000u)
+                                         ? from + 0x20000u : 0x84000000u);
                         if (j) {
                             j = XBOX_CONTIG_BASE | (j & 0x0FFFFFFFu);
-                            if (j < to) nv2a_pb_scan(j, to);
+                            if (j < to) { nv2a_pb_scan(j, to); scanned = 1; }
+                        }
+                    }
+                    /* The segment was read but not decoded to its end, and the
+                     * release the title is waiting on is not in what was left.
+                     * Report it and release the ring; see
+                     * xbox_Nv2aReleaseStalledRing. */
+                    if (scanned) {
+                        extern int g_pb_walk_complete;
+                        extern uint32_t g_pb_walk_end_va;
+                        extern void xbox_Nv2aReleaseStalledRing(void);
+                        if (!g_pb_walk_complete) {
+                            static DWORD last_force;
+                            static int said;
+                            if (now_ms - last_force > 2000) {
+                                last_force = now_ms;
+                                xbox_Nv2aReleaseStalledRing();
+                                if (said++ < 24) {
+                                    fprintf(stderr, "  [PB] segment %08X..%08X not"
+                                                    " decoded past %08X: ring released"
+                                                    " to the submit position\n",
+                                            last_put, put, g_pb_walk_end_va);
+                                    fflush(stderr);
+                                }
+                            }
                         }
                     }
                     /* Periodic, because what the title submits at init is not

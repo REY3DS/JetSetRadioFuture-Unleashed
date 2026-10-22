@@ -4767,6 +4767,25 @@ static void bridge_KeSetBasePriorityThread(void)
     g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
         (PVOID)bridge_thread_object(tok), inc);
     if (getenv("JSRF_DBG")) fprintf(stderr, "  [PRIO] KeSetBasePriorityThread(tok=%08X, inc=%d) from %08X\n", tok, (int)inc, g_xbox_kernel_caller);
+    /* RECOMP_PRIO_LOG=1 records every change of a thread's base priority with
+     * the guest call site that asked for it. CRI's lock saves the priority it
+     * finds on entry and restores it on leave, and its leave loop at 0x001437B0
+     * keeps leaving until the thread is no longer time-critical -- so a saved
+     * value of 15 means the raise was recorded as the thing to restore, and
+     * the history says which call wrote that. Only changes: the raise is
+     * issued again on every iteration of the loop, millions of times. */
+    {   static int prio_log = -1;
+        static unsigned pl_n;
+        if (prio_log < 0) prio_log = getenv("RECOMP_PRIO_LOG") ? 1 : 0;
+        if (prio_log && (int32_t)g_eax != (int32_t)inc && pl_n < 400) {
+            pl_n++;
+            fprintf(stderr, "  [PRIO] tid %lu set %08X <- %d (was %d)"
+                            " from guest %08X\n",
+                    (unsigned long)GetCurrentThreadId(), tok, (int)inc,
+                    (int32_t)g_eax, g_xbox_kernel_caller);
+            fflush(stderr);
+        }
+    }
     /* THREAD_PRIORITY_IDLE (-15 -> KeSetBasePriorityThread(-16)) on the
      * calling thread: it opts out of the guest scheduler lock. */
     if ((tok == 0xFFFFFFFEu) && inc <= -15) {
@@ -6893,6 +6912,126 @@ static void kernel_progress_line(void)
                 }
                 for (i = 0; i < 8; i++) prev[i] = v[i];
                 had = 1;
+
+                /* RECOMP_PB_PROG=1: the executor's side of the same handshake.
+                 * A title waiting on a fence because the GPU has not reached
+                 * the block looks exactly like one waiting because the GPU
+                 * wrote the value somewhere else -- until the position and the
+                 * last semaphore write are side by side. */
+                { static int prog = -1;
+                  static unsigned long pm, ps;
+                  static int ph;
+                  extern uint32_t g_pb_exec_va, g_pb_sem_va, g_pb_sem_val;
+                  extern unsigned long g_pb_exec_methods, g_pb_sem_writes;
+                  extern void recomp_slice_report(void);
+                  extern volatile unsigned long g_lock_owner; extern volatile long long g_lock_since;
+                  extern volatile int g_lock_waiters;
+                  if (prog < 0) { const char *e = getenv("RECOMP_PB_PROG");
+                                  prog = e && e[0] == '1'; }
+                  if (prog) {
+                      int k;
+                      fprintf(stderr, "  [PB] exec va %08X methods %lu (+%lu)"
+                                      " | sem %08X <- %08X x%lu (+%lu) | there:",
+                              g_pb_exec_va, g_pb_exec_methods,
+                              g_pb_exec_methods - pm, g_pb_sem_va,
+                              g_pb_sem_val, g_pb_sem_writes,
+                              g_pb_sem_writes - ps);
+                      for (k = 0; k < 8; k++)
+                          fprintf(stderr, " %08X",
+                                  BRIDGE_MEM32(g_pb_exec_va + 4u * (uint32_t)k));
+                      fprintf(stderr, "\n");
+                      fprintf(stderr, "  [LOCK] owner %ld held %lld ms,"
+                                      " %d queued, slice handoffs %lu"
+                                      " (raised %lu)\n",
+                              g_lock_owner, g_lock_since ? GetTickCount64() - g_lock_since : 0,
+                              g_lock_waiters, g_slice_handoffs, g_slice_held_raised);
+                      recomp_slice_report();
+                      fprintf(stderr, "  [CRI] ctr=%d saved=%d boost=%d"
+                                      " idle=%d server=%08X flag=%d"
+                                      " | leave callback %08X arg %08X\n",
+                              (int32_t)BRIDGE_MEM32(0x25EFA0u),
+                              (int32_t)BRIDGE_MEM32(0x27D0F8u),
+                              (int32_t)BRIDGE_MEM32(0x25EF8Cu),
+                              (int32_t)BRIDGE_MEM32(0x25EF9Cu),
+                              BRIDGE_MEM32(0x27D0E0u),
+                              (int32_t)BRIDGE_MEM32(0x25EFA4u),
+                              BRIDGE_MEM32(0x2615F0u),
+                              BRIDGE_MEM32(0x2615F4u));
+                      fflush(stderr);
+                      pm = g_pb_exec_methods; ps = g_pb_sem_writes; ph = 1;
+                  }
+
+                  /* One-shot ring state once the handshake has not moved for
+                   * five seconds. "The title waits for a fence the GPU never
+                   * wrote" is a statement about two positions: the block the
+                   * title built (in the driver's table) and how far the
+                   * walker got. Printing both here answers it without a
+                   * second build. */
+                  { static DWORD last_ms; static uint32_t last_end, last_sem;
+                    static int dumped;
+                    DWORD now2 = GetTickCount();
+                    if (last_end != v[1] || last_sem != g_pb_sem_writes) {
+                        last_end = v[1]; last_sem = g_pb_sem_writes;
+                        last_ms = now2; dumped = 0;
+                    }
+                    if (prog && !dumped && now2 - last_ms > 5000) {
+                        uint32_t uptr = *(volatile uint32_t *)xbox_HostPtr(0xFD800040u);
+                        uint32_t gptr = *(volatile uint32_t *)xbox_HostPtr(0xFD800044u);
+                        uint32_t tab = BRIDGE_MEM32(dev + 0x4C);
+                        int i, k;
+                        dumped = 1;
+                        fprintf(stderr, "  [PB] FROZEN %lu ms: end %08X shadow %08X"
+                                        " lag %d | udma put %08X get %08X"
+                                        " | exec %08X methods %lu | sem %08X <- %08X x%lu\n",
+                                (unsigned long)(now2 - last_ms), v[1], v[3],
+                                (int)(v[1] - v[3]), uptr, gptr, g_pb_exec_va,
+                                g_pb_exec_methods, g_pb_sem_va, g_pb_sem_val,
+                                g_pb_sem_writes);
+                        fprintf(stderr, "  [PB]   dev: base %08X lim %08X put %08X"
+                                        " head %08X mask %08X tab %08X"
+                                        " ctr %08X/%08X regs %08X/%08X flags %08X\n",
+                                BRIDGE_MEM32(dev + 0x24), BRIDGE_MEM32(dev + 0x28),
+                                v[0], BRIDGE_MEM32(dev + 0x38),
+                                BRIDGE_MEM32(dev + 0x3C), tab,
+                                BRIDGE_MEM32(dev + 0x40), BRIDGE_MEM32(dev + 0x44),
+                                BRIDGE_MEM32(dev + 0x2264), BRIDGE_MEM32(dev + 0x2268),
+                                BRIDGE_MEM32(dev + 8));
+                        for (i = 0; i < 64; i++) {
+                            uint32_t pos = BRIDGE_MEM32(dev + 0x50 + i * 12);
+                            uint32_t blk = BRIDGE_MEM32(dev + 0x54 + i * 12);
+                            uint32_t xtr = BRIDGE_MEM32(dev + 0x58 + i * 12);
+                            if (!pos && !blk) continue;
+                            fprintf(stderr, "  [PB]   slot %2d pos %08X blk %08X xtr %08X%s\n",
+                                    i, pos, blk, xtr,
+                                    pos + 2 >= v[1] - 8 ? "   <-- recent" : "");
+                        }
+                        fprintf(stderr, "  [PB]   ring at put-0x40:");
+                        for (k = -0x40; k < 0x20; k += 4)
+                            fprintf(stderr, " %08X", BRIDGE_MEM32(v[0] + (uint32_t)k));
+                        fprintf(stderr, "\n");
+                        /* The title's own CRI lock bookkeeping, which is what
+                         * the release loop at 0x001437B0 is reading: the loop
+                         * asks the thread's base priority and leaves again
+                         * until it is no longer time-critical, so a saved
+                         * value that is already the raised one never ends. */
+                        fprintf(stderr, "  [PB]   CRI ctr=%d saved=%d boost=%d"
+                                        " idle=%d server=%08X flag=%d"
+                                        " | thread priority %d\n",
+                                (int32_t)BRIDGE_MEM32(0x25EFA0u),
+                                (int32_t)BRIDGE_MEM32(0x27D0F8u),
+                                (int32_t)BRIDGE_MEM32(0x25EF8Cu),
+                                (int32_t)BRIDGE_MEM32(0x25EF9Cu),
+                                BRIDGE_MEM32(0x27D0E0u),
+                                (int32_t)BRIDGE_MEM32(0x25EFA4u),
+                                (int)GetThreadPriority((HANDLE)(LONG_PTR)-2));
+                        { extern void w32_thread_report(void) __attribute__((weak));
+                          extern void w32_handoff_report(void) __attribute__((weak));
+                          if (w32_thread_report) w32_thread_report();
+                          if (w32_handoff_report) w32_handoff_report(); }
+                        fflush(stderr);
+                    }
+                  }
+                }
             }
         }
     }

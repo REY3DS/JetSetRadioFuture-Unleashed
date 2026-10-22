@@ -1421,6 +1421,15 @@ out:
 static uint32_t s_sem_offset, s_sem_handle, s_sem_base;
 static int s_sem_base_known;
 
+/* Diagnostic: how far the executor's walk has got, and where the last
+ * semaphore release landed. RECOMP_PB_PROG=1 prints them from the [PB]
+ * watcher; with the title waiting on a fence this separates "the GPU has not
+ * reached the block" from "the GPU reached it and wrote somewhere else". */
+uint32_t g_pb_exec_va;
+unsigned long g_pb_exec_methods;
+uint32_t g_pb_sem_va, g_pb_sem_val;
+unsigned long g_pb_sem_writes;
+
 /* The physical base of a DMA object, by its handle, through the RAMHT the
  * title's driver built in instance memory (xemu pfifo.c ramht_lookup and
  * nv2a.c nv_dma_load). The NV2A aperture is plain memory in this runtime, so
@@ -1467,6 +1476,7 @@ static unsigned long g_swm_count[17];
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
+    g_pb_exec_methods++;
     if (method == 0x0100 && param) {
         extern void xbox_nv2a_software_method(uint32_t subch, uint32_t param);
         g_swm_count[param < 16 ? param : 16]++;
@@ -1475,7 +1485,26 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (subch == 0 && (method == 0x1D6C || method == 0x1D70 || method == 0x01A4)) {
         static int lg = -1, shown;
         if (lg < 0) lg = getenv("RECOMP_PB_SEMLOG") ? 1 : 0;
-        if (method == 0x1D6C) s_sem_offset = param;
+        if (method == 0x1D6C) {
+            /* A semaphore offset indexes the DMA object the driver gave us, so
+             * it has to be an offset into the contiguous window the title owns
+             * -- four gigabytes of address space are not on offer. Refusing a
+             * value that is not is not a guess about the stream: it is the one
+             * address the fence cannot have. Measured on the Switch: a value
+             * of 0x1D4B1D49 (two 16-bit indices read as one) sent the release
+             * to a wrapped address, the title's fence dword stayed at 0x5735
+             * while it waited for 0x573F, and the loading screen stopped with
+             * the ring's consume counter twelve dwords short. */
+            if ((param & 3u) == 0u && param + s_sem_base + 4u <= 0x04000000u) {
+                s_sem_offset = param;
+            } else {
+                static int said;
+                if (said++ < 8)
+                    fprintf(stderr, "  [SEM] refused SET_SEMAPHORE_OFFSET 0x%08X"
+                                    " at 0x%08X (kept 0x%08X)\n",
+                            param, g_pb_exec_va, s_sem_offset);
+            }
+        }
         if (method == 0x01A4) { s_sem_handle = param; s_sem_base_known = 0; }
         if (lg && shown < 60) { shown++;
             fprintf(stderr, "  [SEM] %s = 0x%08X\n",
@@ -1494,13 +1523,36 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     s_sem_base = ok ? b : 0; s_sem_base_known = 1;
                     fprintf(stderr, "  [SEM] semaphore DMA handle 0x%08X -> physical base 0x%08X%s\n",
                             s_sem_handle, s_sem_base, ok ? "" : " (RAMHT lookup failed, assuming 0)"); fflush(stderr); }
-                va = dma_resolve(s_sem_base + s_sem_offset);
+                {
+                    uint32_t off = s_sem_base + s_sem_offset;
+                    /* Same rule at the release: inside the window, or the
+                     * release answers a fence the title is not waiting on. */
+                    va = ((off & 3u) == 0u && off + 4u <= 0x04000000u)
+                             ? (0x80000000u | off) : 0u;
+                    if (!va) {
+                        static int said;
+                        /* The value is still a fence the driver is waiting on
+                         * and it only ever goes up, so the one address it can
+                         * belong to is the semaphore that was last accepted.
+                         * Dropping it instead is what left the ring frozen on
+                         * the Switch: exec stopped, PUT static, and the title
+                         * spinning at 0x001914F0 with 7.5 million iterations. */
+                        if (g_pb_sem_va >= 0x1000u) va = g_pb_sem_va;
+                        if (said++ < 8)
+                            fprintf(stderr, "  [SEM] refused fence 0x%08X to"
+                                            " offset 0x%08X (base 0x%08X),"
+                                            " wrote the last accepted VA 0x%08X\n",
+                                    param, off, s_sem_base, va);
+                    }
+                }
                 /* dma_resolve returns a guest VA, and a contiguous
                  * allocation's VA is 0x80000000+P -- not an offset from the
                  * RAM base on the Switch, where the two are separate
                  * allocations. */
-                if (va >= 0x1000u && va + 4 <= 0xFFFFFFFCu)
+                if (va >= 0x1000u && va + 4 <= 0xFFFFFFFCu) {
                     *(volatile uint32_t *)xbox_HostPtr(va) = param;
+                    g_pb_sem_va = va; g_pb_sem_val = param; g_pb_sem_writes++;
+                }
             }
         }
     }

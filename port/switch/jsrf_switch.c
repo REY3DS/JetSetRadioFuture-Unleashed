@@ -173,6 +173,14 @@ static const char *const k_env[][2] = {
     { "RECOMP_ABI_RESTORE", "1" }, { "RECOMP_LOCK_IDLE", "1" },
     { "RECOMP_GL_CURTAIN", "skip" }, { "RECOMP_MUTE", "0" }, { "RECOMP_WINDOW", "1" },
     { "RECOMP_FULLSCREEN", "1" },
+    /* CRI raises a thread to time-critical and restores the priority it
+     * found on the way out. Restoring the raised value instead of the saved
+     * one leaves the thread at 15, and its own leave loop at 0x001437B0 then
+     * never ends: 54 million iterations of KeQueryBasePriorityThread, the
+     * loader stopped, measured on the Switch. On by default because it
+     * repairs the title's bookkeeping, not the hardware's behaviour; the
+     * settings file can still turn it off with RECOMP_PRIO_RESTORE=0. */
+    { "RECOMP_PRIO_RESTORE", "1" },
 };
 
 __attribute__((constructor(101))) static void switch_env(void)
@@ -332,9 +340,10 @@ int nv_switch_main(int argc, char **argv, int (*host)(void))
      * ago logs the same first line as today's. This one changes whenever the
      * diagnostics do: if it is missing from the log, the card is running an
      * older .nro and nothing else in the run means anything. */
-    fprintf(stderr, "[SWITCH] diagnostic build 31: RECOMP_PB_WATCH=1 reports "
+    fprintf(stderr, "[SWITCH] diagnostic build 47: RECOMP_PB_WATCH=1 reports "
                     "the push buffer's end, its shadow consume pointer and the "
-                    "channel it is using, once a second on change\n");
+                    "channel; RECOMP_PB_PROG=1 adds the executor's position and "
+                    "the last semaphore release, once a second on change\n");
 
     call.host = host;
     call.rc = 1;
