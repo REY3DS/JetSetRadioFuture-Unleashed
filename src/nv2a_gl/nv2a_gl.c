@@ -643,6 +643,9 @@ static int      g_present_slot = -1;  /* set at FLIP_STALL, see present() */
  * See the note in surface_bind(). */
 static uint32_t g_last_presented_rt;
 static int      g_present_clear_pending;
+/* The target that clear-before-copy blanked, if it has not been drawn into
+ * since. present() must not hand that one to the window. */
+static uint32_t g_cleared_by_us_rt;
 static uint32_t g_last_flip_draws;    /* S.draws at the last FLIP_STALL */
 static int      g_cur_surf = -1;
 /* nv2a_gl_trace_frames(): per-pass log for the next few frames. */
@@ -2171,6 +2174,7 @@ static void surface_bind(uint32_t offset, uint32_t w, uint32_t h)
                                 " the title; clearing it before the copy\n",
                         g_cur_rt);
             G->clear(1u, black, 0.0f, 0u, NULL);
+            g_cleared_by_us_rt = g_cur_rt;
         }
     }
     g_surf_lost = 0;
@@ -9898,7 +9902,32 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
                   if (g_surf[k].last_draw <= g_last_flip_draws) continue;
                   if (best < 0 || g_surf[k].last_draw > g_surf[best].last_draw) best = k;
               }
-          g_present_slot = best >= 0 ? best : m;
+          /*
+           * Never hand the window a target that nothing has been drawn into
+           * since the last flip. `best` cannot be one -- it was picked
+           * precisely because its last_draw is newer than the last flip --
+           * but `m` can: it is the buffer the title has just bound and is
+           * about to copy into, which is two frames behind the game and, when
+           * clear-before-copy has blanked it (see surface_bind), is a black
+           * rectangle.
+           *
+           * Presenting it is the flicker: the screen showed the finished
+           * buffer, then the blank one, then the next finished one, at 20-50
+           * times a second. Holding the last finished frame instead is what
+           * the console does -- the display keeps scanning the buffer it
+           * already has until the next one is ready.
+           */
+          if (best >= 0) g_present_slot = best;
+          else if (m == (int)g_cleared_by_us_rt
+                && g_surf[m].last_draw <= g_last_flip_draws) {
+              static int said;
+              if (!said++)
+                  fprintf(stderr, "  [GL] holding the last frame: the target the"
+                                  " title bound (rt %u) has not been drawn into"
+                                  " since it was blanked\n",
+                          g_surf[m].rt);
+          }
+          else g_present_slot = m;
           g_last_flip_draws = S.draws; }
         if (S.since_present) { fliplog("flip_stall"); present(1); }
         else {
