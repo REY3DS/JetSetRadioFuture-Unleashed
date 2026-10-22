@@ -917,7 +917,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          * than "the path does not exist". */
         if (e == ENOTDIR && (CreateOptions & XBOX_FILE_DIRECTORY_FILE))
             st = 0xC0000103u;   /* STATUS_NOT_A_DIRECTORY */
-        fprintf(stderr, "  [FILE] open %s -> %s FAILED errno=%d opts=0x%X disp=%u -> 0x%08X\n",
+        fprintf(stderr, "  [FILE] t%lu open %s -> %s FAILED errno=%d opts=0x%X disp=%u -> 0x%08X\n",
+                (unsigned long)GetCurrentThreadId(),
                 xbox_path, host_path, e, CreateOptions, CreateDisposition, (unsigned)st);
         if (IoStatusBlock) {
             IoStatusBlock->Status = st;
@@ -931,7 +932,13 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
     }
-    fprintf(stderr, "  [FILE] open %s -> %s (handle=%p, opts=0x%X)\n", xbox_path, host_path, *FileHandle, CreateOptions);
+    fprintf(stderr, "  [FILE] t%lu open %s -> %s (handle=%p, opts=0x%X)\n",
+            (unsigned long)GetCurrentThreadId(), xbox_path, host_path, *FileHandle, CreateOptions);
+    /* The title's own idea of what killed it, captured while it is still true. */
+    if (xbox_path && strstr(xbox_path, "JSRF_FATAL")) {
+        extern void xbox_kernel_error_dump(const char *) __attribute__((weak));
+        if (xbox_kernel_error_dump) xbox_kernel_error_dump(xbox_path);
+    }
     { extern void xbox_file_open_hook(const char *) __attribute__((weak));
       if (xbox_file_open_hook) xbox_file_open_hook(xbox_path); }
     return STATUS_SUCCESS;
@@ -1034,6 +1041,17 @@ NTSTATUS __stdcall xbox_NtWriteFile(
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
     ssize_t n = write(fd, Buffer, Length);
+
+    /* Every write, named. The cache copy the title does on every load is
+     * read-source / create-temp / write-temp, and only the reads were being
+     * logged -- so a copy that stopped half way looked like a title that had
+     * simply stopped asking for anything. */
+    fprintf(stderr, "  [WRITE] %s off=%lld want=%u -> %d%s\n",
+            w32_handle_path(FileHandle) ? w32_handle_path(FileHandle) : "?",
+            (long long)(ByteOffset ? ByteOffset->QuadPart : -1),
+            (unsigned)Length, (int)n, n < 0 ? " FAILED" : "");
+    fflush(stderr);
+
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -1171,7 +1189,10 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     int fd = w32_handle_fd(FileHandle);
     if (fd < 0)
         return STATUS_INVALID_HANDLE;
-    if (getenv("JSRF_DBG")) fprintf(stderr, "  [FILE] NtSetInformationFile class %d len %u fd %d\n", (int)FileInformationClass, (unsigned)Length, fd);
+    fprintf(stderr, "  [FILE] t%lu NtSetInformationFile class %d len %u fd %d path=%s\n",
+            (unsigned long)GetCurrentThreadId(), (int)FileInformationClass,
+            (unsigned)Length, fd,
+            w32_handle_path(FileHandle) ? w32_handle_path(FileHandle) : "?");
 
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
@@ -1207,7 +1228,10 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
              * matches NT "delete on close" semantics exactly. */
             if (info->DeleteFile) {
                 const char* p = w32_handle_path(FileHandle);
-                if (p) unlink(p);
+                int rc = p ? unlink(p) : -1;
+                fprintf(stderr, "  [FILE] t%lu   delete-on-close %s -> %d%s\n",
+                        (unsigned long)GetCurrentThreadId(), p ? p : "?", rc,
+                        rc ? " (the file stays)" : "");
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;

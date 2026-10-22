@@ -435,8 +435,26 @@ extern unsigned g_recomp_tick;
 extern int      g_recomp_hooks;
 extern int      g_recomp_fpcheck;
 void recomp_slice_check(void);
+void recomp_slice_site(uint32_t site_va);
 void recomp_fp_enter(uint32_t va);
 void recomp_fp_exit(uint32_t va);
+
+/* A scheduler look at a loop back-edge.
+ *
+ * The entry hook fires once per call, so a loop with no calls in it never
+ * reaches the scheduler: the guest lock stays with the spinning thread and
+ * every other guest thread waits with it. On the console the timer tick takes
+ * the CPU away wherever the thread happens to be, which is usually a back
+ * edge; this is that tick, and RECOMP_SLICE_SITE() is placed at one by
+ * port/switch/slice_sites.py.
+ *
+ * The counter is plain, not thread-local, on purpose: the tick is a property
+ * of the machine, and the masked test costs one load and one branch.
+ */
+#define RECOMP_SLICE_SITE(va) do { \
+    if (RECOMP_UNLIKELY((++g_recomp_tick & 0x3FFu) == 0u)) \
+        recomp_slice_site((va)); \
+} while (0)
 
 #define RECOMP_TRACE_ENTER(name, va) do { \
     if (RECOMP_UNLIKELY((++g_recomp_tick & 0xFFu) == 0u)) \

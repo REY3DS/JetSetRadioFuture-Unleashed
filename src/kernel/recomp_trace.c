@@ -185,6 +185,72 @@ void recomp_slice_check(void)
     xbox_guest_lock_yield_now();
 }
 
+/* A loop that has stopped moving, named where it is.
+ *
+ * The lift has no per-instruction hook, so "where is this thread" has only
+ * ever been answerable from a kernel call: a bridge entry knows the guest
+ * return address. A thread spinning in a loop inside one function makes no
+ * such call, and that is precisely the thread worth naming.
+ *
+ * g_esp is the guest stack pointer, and at a loop back-edge it does not move:
+ * the loop head is one address, and the frame under it does not change. So a
+ * running thread can tell itself apart from a stuck one by remembering the
+ * last back-edge's esp, and when it has stood at the same one for five
+ * seconds, say so, with the words the guest stack carries. That is the same
+ * shape the crash handler prints, so tools/stackwalk.py reads it too.
+ */
+void recomp_slice_site(uint32_t site_va)
+{
+    static RECOMP_TLS uint32_t last_esp;
+    static RECOMP_TLS long long standing_since, said;
+    extern void xbox_guest_lock_yield_now(void);
+    uint32_t esp = g_esp;
+    long long now = (long long)GetTickCount64();
+
+    /* A loop usually comes back to more than one address, so it is the
+     * stack pointer that says the loop is one loop. */
+    if (esp != last_esp) {
+        last_esp = esp;
+        standing_since = now;
+    } else if (now - standing_since >= 5000 && now - said >= 5000) {
+        int j;
+        said = now;
+        fprintf(stderr, "  [SPIN] tid %lu has looped back to 0x%08X, "
+                        "esp=0x%08X, for %lld ms with no call out of it\n",
+                (unsigned long)GetCurrentThreadId(), site_va, esp,
+                now - standing_since);
+        for (j = 0; j < 24; j++) {
+            uint32_t a = esp + (uint32_t)j * 4u;
+            if (a < 0x00010000u || a >= 0x04000000u) break;
+            fprintf(stderr, "    GS %08X %08X\n", a,
+                    *(volatile uint32_t *)xbox_HostPtr(a));
+        }
+        fflush(stderr);
+    }
+
+    xbox_guest_lock_yield_now();
+
+    /* And once the slice is looked at, take the interrupt this thread is
+     * standing on top of.
+     *
+     * The console's APU interrupt preempts whatever is running, including a
+     * loop that holds a critical section the deferred routine needs. Here the
+     * deferred routine runs on the kernel timer thread, which blocks on that
+     * same critical section, and the two wait for each other. recomp_guest_spin_yield
+     * delivers it on the thread that is spinning instead -- the same handler,
+     * the same lock, the same owner, as the hardware would. It is only worth
+     * calling when the interrupt is actually pending. */
+    {   extern int mcpx_apu_irq_pending_global(void) __attribute__((weak));
+        extern void recomp_guest_spin_yield(uint32_t, uint32_t, uint32_t);
+        static int n;
+        if (mcpx_apu_irq_pending_global && ++n >= 16) {
+            n = 0;
+            if (mcpx_apu_irq_pending_global())
+                recomp_guest_spin_yield(0, 0, 0);
+        }
+    }
+}
+
 void recomp_trace_enable_hooks(void)
 {
     g_recomp_hooks = 1;
@@ -536,3 +602,4 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va)
         fputc('\n', stderr);
     fflush(stderr);
 }
+

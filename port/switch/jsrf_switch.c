@@ -251,9 +251,63 @@ int nv_switch_main(int argc, char **argv, int (*host)(void))
             fprintf(stderr, "[SWITCH] cannot open %s: %s\n", last, strerror(errno));
         }
     }
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
+    /*
+     * Fully buffered, not unbuffered.
+     *
+     * Every write() to sdmc: costs tens of milliseconds and this build logs
+     * thousands of lines while the title boots, so with both streams
+     * unbuffered it is the log -- not the title -- that the run spends its
+     * time on. The measurement was blunt: on 21 Oct the freeze watchdog
+     * dumped 900 lines of guest stack from inside the kernel's timer loop and
+     * that loop, with every DPC the title was waiting for, stood still for
+     * thirty seconds (the gap from [TIME] 15086 ms to [TIME] 45253 ms, the
+     * vblank count frozen at 102 through it). The title timed out on that and
+     * wrote JSRF_FATAL.ERR sixteen seconds later, just after the first sound
+     * bank, where the run before it loaded on.
+     *
+     * The kernel bridge flushes once a second (kernel_progress_line), so a
+     * crash still leaves a log ending within a second of it.
+     */
+    setvbuf(stdout, NULL, _IOFBF, 1 << 16);
+    setvbuf(stderr, NULL, _IOFBF, 1 << 16);
 
+    /*
+     * ...and that a buffered log really is cheap, measured rather than
+     * assumed: 1024 lines fill one buffer, so this is one write.
+     */
+    /* The probe that measured this (0.0024 ms a line, one write for 1024
+     * lines) has done its job; left in, its 1024 lines sit between the reader
+     * and the first thing that matters. */
+
+    /* Any key=value line in the settings file becomes an option.
+     *
+     * Every switch in this port is read once from the environment, and there
+     * is no shell on this host to set one in. Putting them next to "scale"
+     * means a run can try one without a ten-minute rebuild. */
+    {
+        FILE *of = fopen(cfg, "r");
+        if (of) {
+            char line[256];
+            int n = 0;
+            while (fgets(line, sizeof line, of)) {
+                char *k = line, *eq, *v, *e, *t;
+                while (*k == ' ' || *k == '\t') k++;
+                if (*k == '#' || *k == '\n' || *k == '\r' || !*k) continue;
+                eq = strchr(k, '=');
+                if (!eq) continue;
+                *eq = 0;
+                for (t = k + strlen(k); t > k && (t[-1] == ' ' || t[-1] == '\t'); )
+                    *--t = 0;
+                v = eq + 1;
+                for (e = v + strlen(v); e > v && (e[-1] == '\n' || e[-1] == '\r' ||
+                                                  e[-1] == ' ' || e[-1] == '\t'); )
+                    *--e = 0;
+                if (*k && *v) { setenv(k, v, 1); n++; }
+            }
+            fclose(of);
+            fprintf(stderr, "[SWITCH] %d option(s) read from the settings file\n", n);
+        }
+    }
     {
         int s = cfg_get_int(cfg, "scale", 2);
         char scale[8];
@@ -273,6 +327,14 @@ int nv_switch_main(int argc, char **argv, int (*host)(void))
                     "[SWITCH] game: %s\n[SWITCH] log: %s\n",
             JSRF_VERSION, __DATE__, __TIME__, root,
             nx >= 0 ? "nxlink" : last);
+    /* The banner above is the compile stamp of one object file and does not
+     * move when the rest of the tree does, so a build copied to the card days
+     * ago logs the same first line as today's. This one changes whenever the
+     * diagnostics do: if it is missing from the log, the card is running an
+     * older .nro and nothing else in the run means anything. */
+    fprintf(stderr, "[SWITCH] diagnostic build 25: a priority raise issued by "
+                    "an already-raised thread can be read as the restore it is "
+                    "meant to be (RECOMP_PRIO_RESTORE=1 to try it)\n");
 
     call.host = host;
     call.rc = 1;

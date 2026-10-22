@@ -44,6 +44,7 @@
 void xbox_guest_lock_acquire(void);
 void xbox_guest_lock_release(void);
 static void kernel_freeze_watch(void); /* see the bottom of this file */
+static void kernel_error_watch(void);  /* ditto: watches the error flags */
 
 #ifndef MAXIMUM_WAIT_OBJECTS
 #define MAXIMUM_WAIT_OBJECTS 64
@@ -54,7 +55,7 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
  * xbox_memory_layout.h and must match the definitions there -- a plain extern
  * here binds to the TLS template rather than the calling thread's copy, which
  * reads as every register being zero. */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
 extern RECOMP_TLS uint32_t g_seh_ebp;
@@ -416,6 +417,9 @@ static long kernel_log_budget(void)
 
 /* Guest return address of the call currently in a bridge. */
 RECOMP_TLS uint32_t g_xbox_kernel_caller;
+
+/* Defined further down, next to the objects it inspects. */
+static void trace_spin_call(const char *what, uint32_t ordinal);
 
 /* ── Per-ordinal bridge functions ─────────────────────────
  *
@@ -1693,7 +1697,8 @@ static uint32_t xbox_dispatcher_wait(uint32_t va, const long long *timeout_100ns
 
 static void bridge_KeSetEvent(void)
 {
-    uint32_t event_ptr = STACK_ARG(0);
+    trace_spin_call("KeSetEvent", 145);
+        uint32_t event_ptr = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
 
@@ -1708,7 +1713,8 @@ static void bridge_KeSetEvent(void)
 static HANDLE bridge_resolve_handle(uint32_t token);
 static void bridge_KeWaitForSingleObject(void)
 {
-    uint32_t object = STACK_ARG(0);
+    trace_spin_call("KeWaitForSingleObject", 159);
+        uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
     uint32_t wait_mode = STACK_ARG(2);
     uint32_t alertable = STACK_ARG(3);
@@ -2285,7 +2291,8 @@ static volatile LONG g_dpc_head, g_dpc_tail;
 
 static void bridge_KeInsertQueueDpc(void)
 {
-    uint32_t dpc  = STACK_ARG(0);
+    trace_spin_call("KeInsertQueueDpc", 119);
+        uint32_t dpc  = STACK_ARG(0);
     uint32_t arg1 = STACK_ARG(1);
     uint32_t arg2 = STACK_ARG(2);
     LONG tail, next;
@@ -2931,6 +2938,8 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+static void kernel_progress_line(void);
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -3030,7 +3039,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 prev_valid = 1;
             }
         }
+        kernel_progress_line(); /* one line a second, so the log has a clock */
         kernel_freeze_watch(); /* has the picture stopped? */
+        kernel_error_watch();  /* did the title's error flags just move? */
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_pgraph_tick();  /* the GPU's software methods */
         kernel_apu_tick();     /* the APU's interrupt line */
@@ -3652,6 +3663,11 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
 static RECOMP_TLS struct { uint32_t routine, context, iostatus; } t_apc_ring[BRIDGE_APC_RING];
 static RECOMP_TLS int t_apc_head, t_apc_count;
 
+/* Queued on the thread that issued the read, delivered when that thread next
+ * waits alertably. A queue that only grows is a completion the title is still
+ * waiting for. */
+static volatile unsigned long g_apc_queued, g_apc_delivered, g_apc_pending;
+
 static void bridge_queue_apc(uint32_t apc_routine, uint32_t apc_context, uint32_t iostatus)
 {
     if (t_apc_count >= BRIDGE_APC_RING) {
@@ -3665,6 +3681,8 @@ static void bridge_queue_apc(uint32_t apc_routine, uint32_t apc_context, uint32_
     t_apc_ring[i].context = apc_context;
     t_apc_ring[i].iostatus = iostatus;
     t_apc_count++;
+    g_apc_queued++;
+    g_apc_pending++;
 }
 
 /* Deliver every APC queued on this thread; returns how many ran. Called from
@@ -3679,6 +3697,8 @@ int bridge_deliver_pending_apcs(void)
         t_apc_count--;
         if (getenv("JSRF_DBG")) fprintf(stderr, "  [APC] delivering routine=0x%08X ctx=0x%08X\n", r, c);
         deliver_one_apc(r, c, io);
+        g_apc_delivered++;
+        if (g_apc_pending) g_apc_pending--;
         n++;
     }
     return n;
@@ -3860,8 +3880,15 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
-    g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(buffer_va), length, poff);
+    {   long long t0 = (long long)GetTickCount64();
+        g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                    XBOX_TO_NATIVE(buffer_va), length, poff);
+        {   long long dt = (long long)GetTickCount64() - t0;
+            if (dt >= 20)
+                fprintf(stderr, "  [SLOWIO] t%lu read  len=%u took %lld ms\n",
+                        (unsigned long)GetCurrentThreadId(), length, dt);
+        }
+    }
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
@@ -3875,13 +3902,15 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] t%lu @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    (unsigned long)GetCurrentThreadId(),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] t%lu @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    (unsigned long)GetCurrentThreadId(),
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
@@ -3910,8 +3939,15 @@ static void bridge_NtWriteFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
-    g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(buffer_va), length, poff);
+    {   long long t0 = (long long)GetTickCount64();
+        g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
+                    XBOX_TO_NATIVE(buffer_va), length, poff);
+        {   long long dt = (long long)GetTickCount64() - t0;
+            if (dt >= 20)
+                fprintf(stderr, "  [SLOWIO] t%lu write len=%u took %lld ms\n",
+                        (unsigned long)GetCurrentThreadId(), length, dt);
+        }
+    }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
@@ -4254,9 +4290,119 @@ static void bridge_IoCreateSymbolicLink(void)
 }
 
 /* ── ObReferenceObjectByHandle (ordinal 246) ─────────────── */
+/* ── What the spinning thread is actually running
+ *
+ * A guest thread that has been inside a handful of fast ordinals millions of
+ * times is a spin loop of the title's own. The ordinals only say what it is
+ * polling; the guest return address says which loop. On the guest thread it is
+ * real, but anywhere else it is not, so this is printed from inside the bridge
+ * and it says the guest call site plus the first few return addresses the
+ * stack still carries.
+ *
+ * Once a second per thread, hard cap, because the whole point is that the
+ * caller does this millions of times.
+ */
+#define CRI_LOCK_CTR    0x25EFA0u
+#define CRI_LOCK_SAVED  0x27D0F8u
+#define CRI_LOCK_BOOST  0x25EF8Cu
+#define CRI_LOCK_IDLE   0x25EF9Cu
+#define CRI_LOCK_SERVER 0x27D0E0u
+#define CRI_LOCK_FLAG   0x25EFA4u
+
+/* Guest stacks at a stall.
+ *
+ * The kernel summary says which ordinal each thread last called, not where it
+ * is: a thread in a bare loop with no calls in it is invisible to it, and so
+ * is one queueing for the guest lock. The guest stack is the one piece of
+ * evidence that names the title's own frames, and it can only be taken on the
+ * thread itself -- so a stall raises an epoch and each thread dumps once at
+ * its next function entry. */
+static volatile int       g_bt_epoch;
+static RECOMP_TLS int     t_bt_epoch;
+
+static void guest_stack_trace(const char *who, int depth)
+{
+    uint32_t sp = g_esp;
+    uint32_t limit;
+    int shown = 0, i;
+
+    if (!sp)
+        return;
+    limit = (sp & 0xFFFF0000u) + 0x10000u;
+    fprintf(stderr, "  [STACK] %s esp 0x%08X\n", who, sp);
+    for (i = 0; i < 256 && shown < depth; i++) {
+        uint32_t a = sp + (uint32_t)i * 4u;
+        uint32_t w;
+        if (a + 4u > limit || a < sp)
+            break;
+        w = BRIDGE_MEM32(a);
+        if (w >= g_xbox_code_lo && w < g_xbox_code_hi) {
+            fprintf(stderr, "  [STACK]   guest 0x%08X\n", w);
+            shown++;
+        }
+    }
+    fflush(stderr);
+}
+
+static void trace_spin_call(const char *what, uint32_t ordinal)
+{
+    static struct { DWORD tid; unsigned long long last; } seen[16];
+    static int nseen, said;
+    unsigned long long now = GetTickCount64();
+    DWORD tid = GetCurrentThreadId();
+    int i, slot = -1;
+
+    /* Before the rate limit: a stall wants this thread's stack once, and the
+     * limit below would swallow it when the tracer has already spoken. */
+    if (g_bt_epoch && t_bt_epoch != g_bt_epoch) {
+        char who[48];
+        t_bt_epoch = g_bt_epoch;
+        snprintf(who, sizeof who, "tid %lu in %s", (unsigned long)tid, what);
+        guest_stack_trace(who, 12);
+    }
+
+    for (i = 0; i < nseen; i++)
+        if (seen[i].tid == tid) { slot = i; break; }
+    if (slot < 0) {
+        if (nseen >= 16)
+            return;
+        slot = nseen++;
+        seen[slot].tid = tid;
+        seen[slot].last = 0;
+    }
+    if (now - seen[slot].last < 1000ull)
+        return;
+    seen[slot].last = now;
+    if (said >= 40)
+        return;
+    said++;
+
+    fprintf(stderr, "  [SPIN] tid %lu %s (ordinal %u, arg 0x%08X)"
+                    " guest caller 0x%08X esp 0x%08X\n",
+            (unsigned long)tid, what, ordinal,
+            BRIDGE_MEM32(g_esp), g_xbox_kernel_caller, g_esp);
+    {
+        uint32_t limit = (g_esp & 0xFFFF0000u) + 0x10000u;
+        int k, shown = 0;
+        for (k = 0; k < 48 && shown < 6; k++) {
+            uint32_t a = g_esp + (uint32_t)k * 4u;
+            uint32_t w;
+            if (a + 4u > limit)
+                break;
+            w = BRIDGE_MEM32(a);
+            if (w >= g_xbox_code_lo && w < g_xbox_code_hi) {
+                fprintf(stderr, "  [SPIN]   guest 0x%08X\n", w);
+                shown++;
+            }
+        }
+    }
+    fflush(stderr);
+}
+
 static void bridge_ObReferenceObjectByHandle(void)
 {
-    /* Xbox: NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, PVOID ObjectType, PVOID* Object)
+    trace_spin_call("ObReferenceObjectByHandle", 246);
+        /* Xbox: NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, PVOID ObjectType, PVOID* Object)
      * 3 args (not 6 like Windows NT) */
     uint32_t handle = STACK_ARG(0);
     uint32_t obj_type = STACK_ARG(1);
@@ -4485,14 +4631,69 @@ static HANDLE bridge_thread_object(uint32_t token)
 }
 static void bridge_KeQueryBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
+    trace_spin_call("KeQueryBasePriorityThread", 124);
+        g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
         (PVOID)bridge_thread_object(STACK_ARG(0)));
+}
+
+/* CRI's lock, as the title's own globals describe it.
+ *
+ * Its "enter" saves the caller's priority, raises it to the config value and
+ * counts the nesting; its "leave" drops the count and, at zero, restores the
+ * saved number. A loop in the title releases until it is no longer raised, so
+ * the counter and the saved value have to stay in step. They are the title's,
+ * not this layer's, but when that loop spins these are the two numbers that
+ * say why. */
+
+/* A thread that is raised a second time is being put back.
+ *
+ * The title's sound driver takes a lock by raising its own thread to
+ * time-critical, and gives it back by restoring a priority it saved on the
+ * way in -- but the slot it saves into is one word shared by every thread, so
+ * when two of them are inside at once the word can end up holding the raised
+ * value. Restoring it then raises the thread again, and the driver's own
+ * release loop (sub_001437B0: "while my priority is still time-critical,
+ * release the lock") never ends. Measured: sixty-four million calls in forty
+ * seconds, the counter running to -1.2 million, the loader stopped.
+ *
+ * The raise and the restore are the only two ways this title ever asks for
+ * time-critical, and the restore asks for the value it is already at. So a
+ * request to raise a thread that has been raised and not yet put back is read
+ * as the restore it is meant to be, and the priority the thread had before the
+ * raise is what it gets. Behind RECOMP_PRIO_RESTORE so the two behaviours can
+ * be measured on one build: this is a repair of the title's own bookkeeping,
+ * not something the hardware does.
+ */
+static int prio_restore_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PRIO_RESTORE");
+        on = (e && strcmp(e, "0") != 0);
+        fprintf(stderr, "  [PRIO] a raise while already raised is %s\n",
+                on ? "read as the restore it is meant to be"
+                   : "passed through unchanged");
+    }
+    return on;
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
     uint32_t tok = STACK_ARG(0);
     LONG inc = (LONG)STACK_ARG(1);
+    {   static RECOMP_TLS int pre_boost;
+        static RECOMP_TLS int have_pre;
+        if (prio_restore_on() && tok == 0xFFFFFFFEu) {
+            int cur = (int)xbox_KeQueryBasePriorityThread(
+                (PVOID)bridge_thread_object(tok));
+            if (inc >= 15) {
+                if (have_pre) { inc = pre_boost; have_pre = 0; }
+                else if (cur < 15) { pre_boost = cur; have_pre = 1; }
+            } else if (inc < 15) {
+                have_pre = 0;
+            }
+        }
+    }
     g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
         (PVOID)bridge_thread_object(tok), inc);
     if (getenv("JSRF_DBG")) fprintf(stderr, "  [PRIO] KeSetBasePriorityThread(tok=%08X, inc=%d) from %08X\n", tok, (int)inc, g_xbox_kernel_caller);
@@ -4595,7 +4796,8 @@ static void bridge_NtReleaseMutant(void)
  */
 static void bridge_NtSuspendThread(void)
 {
-    uint32_t count_va = STACK_ARG(1);
+    trace_spin_call("NtSuspendThread", 231);
+        uint32_t count_va = STACK_ARG(1);
     uint32_t handle = STACK_ARG(0);
     HANDLE h = bridge_resolve_handle(handle);
     NTSTATUS st = xbox_NtSuspendThread(
@@ -4660,7 +4862,8 @@ static void bridge_NtSuspendThread(void)
 /* ── NtResumeThread (ordinal 224, 2 args) */
 static void bridge_NtResumeThread(void)
 {
-    g_eax = (uint32_t)xbox_NtResumeThread(
+    trace_spin_call("NtResumeThread", 224);
+        g_eax = (uint32_t)xbox_NtResumeThread(
         bridge_resolve_handle(STACK_ARG(0)),
         (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
 }
@@ -4671,7 +4874,8 @@ static void bridge_NtResumeThread(void)
  * dereference whatever the caller happened to leave there. */
 static void bridge_ObfDereferenceObject(void)
 {
-    xbox_ObfDereferenceObject(XBOX_TO_NATIVE(g_ecx));
+    trace_spin_call("ObfDereferenceObject", 250);
+        xbox_ObfDereferenceObject(XBOX_TO_NATIVE(g_ecx));
     g_eax = 0;
 }
 
@@ -6263,6 +6467,21 @@ static void lock_holder_where(void)
 static volatile int g_lock_waiters;
 static volatile long long     g_lock_since;
 
+/* When this run of the guest lock began, and who began it.
+ *
+ * Separate from g_lock_since on purpose: g_lock_since is the latest take, and
+ * a thread that drops the lock around a kernel call that returns at once takes
+ * it straight back before any waiter wakes. Measured from there, the slice
+ * never expires and one thread keeps the lock while everybody else queues --
+ * which is what "lock owner 1004 held 0 ms, 1 queued" for ninety seconds is.
+ * The console switches threads on a clock, not on a lock, so what matters is
+ * how long this run of ownership has lasted, whoever took it in between. */
+static volatile long        g_slice_owner;
+static volatile long long   g_slice_since;
+static unsigned long        g_slice_handoffs;
+static unsigned long        g_slice_held_raised;
+
+
 /* Per-thread queueing statistics, kept in a small fixed table so that
  * reporting them needs no allocation and no lock of its own. */
 #define LOCK_SLOTS 16
@@ -6386,6 +6605,10 @@ void xbox_guest_lock_acquire(void)
     g_lock_owner_pt = pthread_self();
 #endif
     g_lock_since = t_guest_since;
+    if (g_slice_owner != g_lock_owner) {
+        g_slice_owner = g_lock_owner;
+        g_slice_since = t_guest_since;
+    }
 }
 
 /*
@@ -6417,6 +6640,128 @@ void xbox_guest_lock_acquire(void)
  * and returns unless a single hold has passed half a second, which never
  * happens in a healthy run.
  */
+/* One line a second, side by side: the clock the rest of the log has no
+ * other way to get.
+ *
+ * "Loading is slow" has three candidate answers -- not reading, not drawing,
+ * or not running -- and every summary in this file is per call count, which
+ * cannot tell them apart. Bytes read per second, frames presented per second,
+ * and who holds the guest lock, once a second, can.
+ */
+/*
+ * The title's own state machine, once a second, only when it changes.
+ *
+ * The disc message is not raised by the loader: it comes out of the main
+ * loop's reset branch (sub_000123E0 walks a list of subsystems and one node's
+ * virtual call ends in the message). So what matters is the mode the loop is
+ * in and when it changes -- these are the fields that select the branch.
+ */
+/*
+ * The loading steps, once a second, only when the picture changes.
+ *
+ * The title arms a twenty-one-entry step table (0x1EC0F0) and each step's
+ * function returns non-zero when it is finished; a step that never finishes
+ * is what the fifteen-second watchdog turns into "there's a problem with the
+ * disc". The list hangs off the app object at +0x87DC, so it can be walked
+ * from the known pointer without scanning anything.
+ */
+static void xbox_load_step_watch(void)
+{
+    static uint32_t last[8][3];
+    static int said, have_last;
+    uint32_t app = BRIDGE_MEM32(0x22FCE0u);
+    uint32_t node;
+    int i, changed = 0;
+
+    if (app < 0x00010000u || app >= 0x04000000u)
+        return;
+    node = BRIDGE_MEM32(app + 0x87DCu);
+    for (i = 0; i < 8 && node >= 0x00010000u && node < 0x04000000u; i++) {
+        uint32_t vt = BRIDGE_MEM32(node);
+        uint32_t armed = BRIDGE_MEM32(node + 0x44u);
+        uint32_t step = BRIDGE_MEM32(node + 0x48u);
+        int moved = (!have_last || last[i][0] != node ||
+                     last[i][1] != armed || last[i][2] != step);
+        if (moved) {
+            changed = 1;
+            if (said < 60)
+                fprintf(stderr, "  [STEP] node %08X vtable %08X armed %08X "
+                                "step %08X\n", node, vt, armed, step);
+        }
+        last[i][0] = node;
+        last[i][1] = armed;
+        last[i][2] = step;
+        node = BRIDGE_MEM32(node + 0x30u);
+    }
+    if (changed) {
+        have_last = 1;
+        said++;
+        fflush(stderr);
+    }
+}
+
+static void kernel_app_state_line(void)
+{
+    static uint32_t last[8];
+    static int said, have_last;
+    uint32_t app, now[8];
+    int i, changed = 0;
+
+    app = BRIDGE_MEM32(0x22FCE0u);
+    if (app < 0x00010000u || app >= 0x04000000u)
+        return;
+    now[0] = BRIDGE_MEM32(app + 0x10u);
+    now[1] = BRIDGE_MEM32(app + 0x24u);
+    now[2] = BRIDGE_MEM32(app + 0x40u);
+    now[3] = BRIDGE_MEM32(app + 0x44u);
+    now[4] = BRIDGE_MEM32(app + 0x48u);
+    now[5] = BRIDGE_MEM32(app + 0x4Cu);
+    now[6] = BRIDGE_MEM32(app + 0x78u);
+    now[7] = BRIDGE_MEM32(app + 0x87DCu);
+    for (i = 0; i < 8; i++)
+        if (!have_last || now[i] != last[i])
+            changed = 1;
+    if (!changed || said > 40)
+        return;
+    have_last = 1;
+    said++;
+    for (i = 0; i < 8; i++)
+        last[i] = now[i];
+    fprintf(stderr, "  [STATE] app %08X: +10 %08X +24 %08X 40 %08X 44 %08X "
+                    "48 %08X 4C %08X 78 %08X +87DC %08X\n",
+            app, now[0], now[1], now[2], now[3], now[4], now[5], now[6], now[7]);
+    fflush(stderr);
+}
+
+static void kernel_progress_line(void)
+{
+    extern unsigned long long g_read_bytes, g_read_calls;
+    extern unsigned long nv2a_gl_progress(void) __attribute__((weak));
+    static long long started, last;
+    static unsigned long long last_read;
+    static unsigned long last_frames;
+    long long now = (long long)GetTickCount64();
+    unsigned long frames;
+    double secs;
+
+    if (!started) { started = last = now; last_read = g_read_bytes; return; }
+    if (now - last < 1000) return;
+    secs = (double)(now - last) / 1000.0;
+    frames = nv2a_gl_progress ? nv2a_gl_progress() : 0;
+    fprintf(stderr, "  [TIME] %7lld ms  frames %lu (+%.1f/s)  "
+                    "read %llu KB (+%.0f KB/s, %llu calls)  "
+                    "lock owner %lu held %lld ms, %d queued\n",
+            now - started, frames, (double)(frames - last_frames) / secs,
+            g_read_bytes >> 10,
+            (double)(g_read_bytes - last_read) / 1024.0 / secs,
+            g_read_calls, (unsigned long)g_lock_owner,
+            g_lock_since ? now - g_lock_since : 0, (int)g_lock_waiters);
+    fflush(stderr);
+    last = now; last_read = g_read_bytes; last_frames = frames;
+    kernel_app_state_line();
+    xbox_load_step_watch();
+}
+
 void xbox_guest_lock_report(void)
 {
     static long long said;
@@ -6699,6 +7044,13 @@ void recomp_guest_spin_yield(uint32_t site_va, uint32_t obj_va, uint32_t flags)
  */
 void xbox_guest_lock_yield_now(void)
 {
+    /* A stall was seen: say where this thread is standing. */
+    if (g_bt_epoch && t_bt_epoch != g_bt_epoch) {
+        char who[48];
+        t_bt_epoch = g_bt_epoch;
+        snprintf(who, sizeof who, "tid %lu", (unsigned long)GetCurrentThreadId());
+        guest_stack_trace(who, 10);
+    }
     /* Stop here if another guest thread has suspended this one.
      *
      * Checked before the time slice and outside the guest lock, both
@@ -6717,10 +7069,34 @@ void xbox_guest_lock_yield_now(void)
         }
     }
     if (!t_guest_holds) return;
-    { static long long slice = -1;
+    /* Measured from the last change of hands, not from this thread's latest
+     * take. RECOMP_SLICE_FROM_RETAKE=1 restores the old measurement. */
+    { static long long slice = -1, raised = -1;
+      static int from_retake = -1;
+      long long ran;
       if (slice < 0) { const char *e = getenv("RECOMP_SLICE_MS");
                        slice = e ? atoll(e) : 4; if (slice < 0) slice = 0; }
-      if ((long long)GetTickCount64() - t_guest_since < slice) return; }
+      if (from_retake < 0)
+          from_retake = getenv("RECOMP_SLICE_FROM_RETAKE") ? 1 : 0;
+      ran = (long long)GetTickCount64() -
+            (from_retake ? t_guest_since : g_slice_since);
+      if (ran < slice) return;
+      /* Not at DISPATCH_LEVEL or above: the console switches no threads
+       * there, and a driver raises IRQL to keep its own deferred routine out
+       * of what it is rewriting -- which the timer thread would run as soon
+       * as it had the lock. Measured from the same start, so a holder that
+       * only leaves raised IRQL late hands over at once; and past
+       * RECOMP_SLICE_RAISED_MS it hands over anyway, for a spin at raised
+       * IRQL that waits on an interrupt only the timer thread can deliver. */
+      if (raised < 0) { const char *e = getenv("RECOMP_SLICE_RAISED_MS");
+                        raised = e ? atoll(e) : 50; if (raised < 0) raised = 0; }
+      if (!from_retake && ran < raised) {
+          extern unsigned char xbox_KeCurrentIrql(void);
+          if (xbox_KeCurrentIrql() >= DISPATCH_LEVEL) {
+              g_slice_held_raised++;
+              return;
+          }
+      } }
     xbox_guest_lock_release();
     /*
      * Hand the lock over, rather than merely offering it.
@@ -6753,7 +7129,13 @@ void xbox_guest_lock_yield_now(void)
       } else {
           SwitchToThread();
       } }
+    g_slice_handoffs++;
     xbox_guest_lock_acquire();
+    /* Whoever held it in between, this thread's turn starts here: otherwise a
+     * release nobody took leaves the slice expired and the holder stands back
+     * on every entry hook. */
+    g_slice_owner = GetCurrentThreadId();
+    g_slice_since = (long long)GetTickCount64();
 }
 /* Give the guest lock up across a wait that is not a kernel call.
  *
@@ -7083,6 +7465,10 @@ typedef struct {
     volatile long long entered_ms; /* when the call began */
     volatile long long left_ms;    /* when it returned; 0 while inside */
     volatile unsigned long long calls;
+    /* Guest esp at that call site -- the caller's frame, past the return
+     * address the thunk pushed. Read from the timer thread to walk this
+     * thread's guest call chain while it is stuck; see kthread_stacks. */
+    volatile uint32_t esp;
     /* The thread's own mach port, recorded by the thread itself because only
      * it can ask for it. With this, a watchdog on another thread can read
      * this one's program counter -- which is the only way to see a thread
@@ -7166,18 +7552,494 @@ static void thread_where(uint32_t mport, unsigned long long tid)
  * Runs on the kernel timer thread, which takes no guest lock to do any of
  * this -- deliberately, since the thread being diagnosed is quite likely the
  * one holding it. */
+/* The guest call chain behind each thread's last kernel call.
+ *
+ * The thread table says which call each thread is inside; it does not say how
+ * it got there, and for a loader that has stopped that is the whole question.
+ * A recompiled call pushes a guest return address and jumps, so the guest
+ * stack of a thread parked in the kernel still carries one word per live
+ * frame -- reading them back reconstructs the chain the title actually took.
+ *
+ * Dumped in the same `GS addr value` form the crash handler uses, so
+ * tools/stackwalk.py decodes either against disasm/output/functions.json.
+ * Once per stall: 32 words a thread names the chain this port can walk, and
+ * the state does not change while it lasts. It used to be 128 -- four times
+ * the lines for no more chain, printed from the kernel's timer loop, where
+ * they cost the title real time.
+ */
+static void kthread_stacks(void)
+{
+    extern volatile uint32_t g_icall_trace[16];
+    extern volatile uint32_t g_icall_trace_idx;
+    long i, n = g_kthread_n;
+    uint32_t k;
+
+    fprintf(stderr, "  [FROZEN] recent indirect calls (oldest first):");
+    for (k = 0; k < 16; k++)
+        fprintf(stderr, " %08X", g_icall_trace[(g_icall_trace_idx + k) & 15]);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  [FROZEN] guest lock: owner tid %lu, held %lld ms, "
+                    "%d thread(s) queued for it\n",
+            (unsigned long)g_lock_owner,
+            g_lock_since ? (long long)GetTickCount64() - g_lock_since : 0,
+            (int)g_lock_waiters);
+
+    for (i = 0; i < n && i < KTHREAD_SLOTS; i++) {
+        const KThreadState *kt = &g_kthreads[i];
+        uint32_t j, a;
+        if (!kt->esp) continue;
+        fprintf(stderr, "  [FROZEN] tid %llu, last call ordinal %u from "
+                        "0x%08X, guest esp=0x%08X:\n",
+                kt->tid, kt->ordinal, kt->caller, kt->esp);
+        for (j = 0; j < 32; j++) {
+            a = kt->esp + j * 4u;
+            if (a < 0x00010000u || a >= 0x04000000u) break;
+            fprintf(stderr, "    GS %08X %08X\n", a, BRIDGE_MEM32(a));
+        }
+    }
+    fflush(stderr);
+}
+
+/*
+ * What the title decided to die of, at the moment it decided.
+ *
+ * sub_0006EC80 -- a per-frame vtable method -- ticks the error manager at
+ * guest 0x22FCE0 and then, if its own flags at +0x98 carry 0x400000, writes
+ * JSRF_FATAL.ERR and stops presenting. The report itself is empty, so the
+ * only record of what went wrong is the error manager's own memory, and the
+ * only moment it is still true is the moment the file is opened. The file
+ * layer calls this from there.
+ */
+static void kernel_error_object_hex(void)
+{
+    uint32_t obj = BRIDGE_MEM32(0x22FCE0u);
+    uint32_t renderer = BRIDGE_MEM32(0x251D6Cu);
+    int i;
+
+    fprintf(stderr, "  [ERROR] error manager %08X, renderer %08X\n", obj, renderer);
+    if (obj) {
+        for (i = 0; i < 0x100; i += 16)
+            fprintf(stderr, "    [ERROR] %08X: %08X %08X %08X %08X\n",
+                    obj + i, BRIDGE_MEM32(obj + i), BRIDGE_MEM32(obj + i + 4),
+                    BRIDGE_MEM32(obj + i + 8), BRIDGE_MEM32(obj + i + 12));
+    }
+    if (renderer) {
+        for (i = 0; i < 0x80; i += 16)
+            fprintf(stderr, "    [ERROR] r%08X: %08X %08X %08X %08X\n",
+                    renderer + i, BRIDGE_MEM32(renderer + i),
+                    BRIDGE_MEM32(renderer + i + 4),
+                    BRIDGE_MEM32(renderer + i + 8),
+                    BRIDGE_MEM32(renderer + i + 12));
+    }
+}
+
+/*
+ * The loading screen's text elements.
+ *
+ * The method that writes JSRF_FATAL.ERR (sub_0006EC80) is the draw of a UI
+ * text element, not a system routine: it tests its own style flags at +0x98
+ * for 0x1000000, 0x800000, 0x2000000 and, on 0x400000, calls the error
+ * manager's report writer. So the object that gives up is a label, its text
+ * is at +0xA0, and its class is named by the vtable it was built with,
+ * 0x001CC660. The object is handed to xbox_label_hook by the draw itself, and
+ * the report is dumped from there, so the list of texts and the state of the
+ * flags both come from objects the title is actively drawing -- nothing is
+ * scanned and no address is guessed.
+ */
+#define LABEL_VTABLE  0x001CC660u
+#define LABEL_MAX     32
+
+static uint32_t label_obj[LABEL_MAX];
+static uint32_t label_flags[LABEL_MAX];
+static int label_count;
+static int label_draws;
+static int label_change_lines;
+static int label_mismatch;
+static int label_creations;
+static int label_fatal_said;
+
+static void label_text(uint32_t va, char *out, int size)
+{
+    int i = 0;
+    out[0] = 0;
+    /* Image and guest RAM only: the string pointer comes from a live object,
+     * but a stale one can still aim anywhere, and reading a device window the
+     * host never mapped is a data abort, not a wrong answer. */
+    if (!va || va < 0x00010000u || va >= 0x04000000u - 64u)
+        return;
+    while (i < size - 1) {
+        uint8_t c = BRIDGE_MEM8(va + i);
+        if (!c) break;
+        out[i++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+    }
+    out[i] = 0;
+}
+
+static void label_print(uint32_t va)
+{
+    char text[64];
+    label_text(BRIDGE_MEM32(va + 0xA0u), text, sizeof text);
+    fprintf(stderr, "  [LABEL] %08X flags %08X font %08X text \"%s\"\n",
+            va, BRIDGE_MEM32(va + 0x98u), BRIDGE_MEM32(va + 0xA4u), text);
+}
+
+/* The guest's own frame chain, walked from the thread that is drawing. It
+ * says which screen and which loop is showing the element, and that is the
+ * half of the story the flags cannot tell. */
+static void label_guest_frames(const char *why)
+{
+    uint32_t ebp = g_ebp;
+    int i;
+
+    fprintf(stderr, "  [LABEL] guest frames at %s:\n", why);
+    for (i = 0; i < 20; i++) {
+        uint32_t next, ret;
+        if (ebp < 0x00010000u || ebp >= 0x03FFFFF8u)
+            break;
+        next = BRIDGE_MEM32(ebp);
+        ret  = BRIDGE_MEM32(ebp + 4u);
+        fprintf(stderr, "  [LABEL]   %2d ebp %08X ret %08X\n", i, ebp, ret);
+        if (next <= ebp + 8u)
+            break;
+        ebp = next;
+    }
+}
+
+static void label_dump_all(const char *why)
+{
+    int i;
+    fprintf(stderr, "  [LABEL] %s: %d text element(s)\n", why, label_count);
+    for (i = 0; i < label_count; i++)
+        label_print(label_obj[i]);
+}
+
+/*
+ * The constructor (sub_0006F200) is where the style word is set -- it stores
+ * its own argument at +0x98 -- so the 0x400000 that the draw acts on was not
+ * raised later: the element was *built* with it by whoever had already
+ * decided the disc was bad. The caller of this constructor is the decision,
+ * and the string argument is the message it chose.
+ *
+ * The arguments sit at the guest stack when it is entered, so they are read
+ * there: six words, the first printable string among them, and the frame
+ * chain of the caller.
+ */
+static int label_looks_like_text(uint32_t va)
+{
+    int i;
+    if (va < 0x00011000u || va >= 0x04000000u)
+        return 0;
+    for (i = 0; i < 6; i++) {
+        uint8_t c = BRIDGE_MEM8(va + (uint32_t)i);
+        if (c < 0x20 || c > 0x7E)
+            return 0;
+    }
+    return 1;
+}
+
+void xbox_label_created(uint32_t this_va)
+{
+    uint32_t a[6];
+    char text[56];
+    int i, fatal = 0, said = 0;
+
+    if (this_va < 0x00010000u || this_va >= 0xF0000000u)
+        return;
+    for (i = 0; i < 6; i++) {
+        a[i] = BRIDGE_MEM32(g_esp + 4u + 4u * (uint32_t)i);
+        if (a[i] & 0x400000u)
+            fatal = 1;
+    }
+    label_creations++;
+    if (label_creations > 12 && !fatal)
+        return;
+
+    fprintf(stderr, "  [LABEL] ctor %08X #%d args", this_va, label_creations);
+    for (i = 0; i < 6; i++)
+        fprintf(stderr, " %08X", a[i]);
+    for (i = 0; i < 6 && !said; i++) {
+        if (!label_looks_like_text(a[i]))
+            continue;
+        label_text(a[i], text, sizeof text);
+        fprintf(stderr, " text@%08X \"%s\"", a[i], text);
+        said = 1;
+    }
+    fprintf(stderr, "\n");
+    if (fatal) {
+        fprintf(stderr, "  [LABEL] ^ this element is being built with the "
+                        "0x400000 style: the caller decided it\n");
+        label_guest_frames("the constructor that carries the bit");
+    }
+    else if (label_creations <= 12) {
+        label_guest_frames("the constructor");
+    }
+    fflush(stderr);
+}
+
+/*
+ * "There's a problem with the disc you're using" -- the message the title
+ * shows when it has decided a read failed. It has exactly four producers in
+ * the generated code: two tails of a 0xE4E1C0-byte read completion check
+ * (sub_00025310 / sub_00025400), one behind a status test in sub_00066440,
+ * and one in a four-iteration loop in sub_00116E30_gen. All four go through
+ * sub_0006F730_gen, so its return address names the producer, and the
+ * registers name the state that made it decide.
+ */
+void xbox_disc_error_hook(uint32_t esp_at_entry)
+{
+    uint32_t limit = (esp_at_entry & 0xFFFF0000u) + 0x10000u;
+    uint32_t a = esp_at_entry;
+    int i;
+
+    fprintf(stderr, "  [DISC] the disc error is being raised by 0x%08X\n",
+            BRIDGE_MEM32(a));
+    fprintf(stderr, "  [DISC] regs eax %08X ebx %08X ecx %08X edx %08X "
+                    "esi %08X edi %08X ebp %08X esp %08X\n",
+            g_eax, g_ebx, g_ecx, g_edx, g_esi, g_edi, g_ebp, g_esp);
+    if (g_esi >= 0x00010000u && g_esi < 0x04000000u) {
+        uint32_t step = BRIDGE_MEM32(g_esi + 0x48u);
+        fprintf(stderr, "  [DISC] watchdog: armed %08X step %08X (0x%X) "
+                        "cb %08X start %08X:%08X kept %08X\n",
+                BRIDGE_MEM32(g_esi + 0x44u), step, step,
+                step < 0x21u ? BRIDGE_MEM32(0x1EC0F0u + step * 4u) : 0u,
+                BRIDGE_MEM32(g_esi + 0x194u), BRIDGE_MEM32(g_esi + 0x190u),
+                BRIDGE_MEM32(g_esi + 0x60u));
+    }
+    if (g_esi >= 0x00010000u && g_esi < 0x04000000u) {
+        uint32_t vt = BRIDGE_MEM32(g_esi);
+        fprintf(stderr, "  [DISC] node %08X: vtable %08X target %08X "
+                        "flag %08X child %08X next %08X\n",
+                g_esi, vt,
+                (vt >= 0x00010000u && vt < 0x04000000u) ? BRIDGE_MEM32(vt + 4u) : 0u,
+                BRIDGE_MEM32(g_esi + 4u), BRIDGE_MEM32(g_esi + 0x28u),
+                BRIDGE_MEM32(g_esi + 0x30u));
+    }
+    {   /* the object the main loop lives in */
+        uint32_t app = BRIDGE_MEM32(0x22FCE0u);
+        if (app >= 0x00010000u && app < 0x04000000u) {
+            fprintf(stderr, "  [DISC] app %08X: +10 %08X +24 %08X "
+                            "40 %08X 44 %08X 48 %08X 4C %08X 78 %08X "
+                            "+87DC %08X\n",
+                    app, BRIDGE_MEM32(app + 0x10u), BRIDGE_MEM32(app + 0x24u),
+                    BRIDGE_MEM32(app + 0x40u), BRIDGE_MEM32(app + 0x44u),
+                    BRIDGE_MEM32(app + 0x48u), BRIDGE_MEM32(app + 0x4Cu),
+                    BRIDGE_MEM32(app + 0x78u), BRIDGE_MEM32(app + 0x87DCu));
+        }
+    }
+    for (i = 0; i < 64; i++) {
+        uint32_t x = a + (uint32_t)i * 4u;
+        if (x < 0x00010000u || x + 4u > limit || x + 4u > 0x03FFFFF8u)
+            break;
+        fprintf(stderr, "  [DISC]  esp+%03X", i * 4);
+        fprintf(stderr, " %08X", BRIDGE_MEM32(x));
+        if ((i & 3) == 3)
+            fprintf(stderr, "\n");
+    }
+    if ((i & 3) != 0)
+        fprintf(stderr, "\n");
+    label_guest_frames("the disc error");
+    fflush(stderr);
+}
+
+/*
+ * The hook: called from the generated draw of a UI text element
+ * (sub_0006EC80, first instruction), where ecx is the element itself.
+ *
+ * The previous build swept the heap for the class vtable instead, and that
+ * faulted on hardware -- read of guest 0x01F80000 -- which means the sweep
+ * was also reading memory no one has ever proven is mapped. This way nothing
+ * is scanned: the object arrives by argument, every read is a field of it.
+ *
+ * The draw is where the bit matters. It tests 0x1000000, 0x800000, 0x2000000
+ * and 0x400000, and 0x400000 is the one that calls the error manager's
+ * report writer (sub_00012770, the JSRF_FATAL.ERR open). Seeing the flags at
+ * the draw catches the bit at the frame that acts on it.
+ */
+void xbox_label_hook(uint32_t va)
+{
+    uint32_t f;
+    int i;
+
+    if (va < 0x00010000u || va >= 0xF0000000u)
+        return;
+    if (BRIDGE_MEM32(va) != LABEL_VTABLE) {
+        if (label_mismatch < 4) {
+            label_mismatch++;
+            fprintf(stderr, "  [LABEL] draw %08X: [+0] is %08X, not the "
+                    "1CC660 vtable\n", va, BRIDGE_MEM32(va));
+        }
+        return;
+    }
+    label_draws++;
+    f = BRIDGE_MEM32(va + 0x98u);
+
+    for (i = 0; i < label_count; i++)
+        if (label_obj[i] == va) break;
+
+    if (i == label_count) {
+        if (label_count >= LABEL_MAX)
+            return;
+        label_obj[label_count] = va;
+        label_flags[label_count] = f;
+        label_count++;
+        fprintf(stderr, "  [LABEL] element #%d is drawn: ", label_count);
+        label_print(va);
+        fflush(stderr);
+        if (f & 0x400000u)
+            goto fatal;
+        return;
+    }
+    if (f == label_flags[i])
+        return;
+    if (label_change_lines < 200) {
+        label_change_lines++;
+        fprintf(stderr, "  [LABEL] %08X flags %08X -> %08X\n",
+                va, label_flags[i], f);
+    }
+    label_flags[i] = f;
+    if (!(f & 0x400000u) || label_fatal_said)
+        return;
+fatal:
+    if (label_fatal_said)
+        return;
+    label_fatal_said = 1;
+    fprintf(stderr, "\n  [LABEL] the fatal style bit 0x400000 is set on %08X "
+                    "at draw %d; this is the draw that writes the report:\n",
+            va, label_draws);
+    label_dump_all("every text element seen so far");
+    label_guest_frames("the draw that carries the bit");
+    kernel_error_object_hex();
+    kthread_report();
+    fflush(stderr);
+}
+
+/*
+ * How much of the 64 MB the host actually has.
+ *
+ * Build 6's sweep faulted reading guest 0x01F80000 after having read the same
+ * pages for a minute, which cannot happen in a block that is mapped once and
+ * then left alone: either something unmapped part of it, or it never was
+ * 64 MB. This walks the declared RAM one page per 4 MB, printing before each
+ * read, so a log that ends here ends on the answer. It runs only at the
+ * report, when everything else has already been written.
+ */
+static void kernel_ram_probe(void)
+{
+    extern uint32_t g_xbox_ram_size;
+    uint32_t mb, top = g_xbox_ram_size / (1024u * 1024u);
+
+    fprintf(stderr, "  [RAM] declared %u KB; reading one page per 4 MB (a "
+                    "fault here ends the run, the last line is the end):\n",
+            (unsigned)(g_xbox_ram_size / 1024u));
+    for (mb = 4; mb <= top; mb += 4) {
+        uint32_t at = (mb << 20) - 4u;
+        fprintf(stderr, "  [RAM]   %2u MB at %08X ... ", mb, at);
+        fflush(stderr);
+        fprintf(stderr, "reads %08X\n", (unsigned)BRIDGE_MEM32(at));
+        fflush(stderr);
+    }
+}
+
+void xbox_kernel_error_dump(const char *why)
+{
+    fprintf(stderr, "\n  [ERROR] the title is writing its fatal report (%s)\n", why);
+    label_dump_all("text elements at the report");
+    kernel_error_object_hex();
+    kthread_report();
+    kthread_stacks();
+    kernel_ram_probe();
+    fflush(stderr);
+}
+
+/*
+ * The app object at 0x22FCE0 carries the real state, and its flags at +0x98
+ * carry the bit the frame method tests before it writes the fatal marker.
+ * The marker dump says what the state was when the title gave up; this says
+ * *when* it changed, from which the flag's setter can be named -- every
+ * thread's last kernel call and guest stack are still there at that moment.
+ *
+ * Armed as soon as the title presents a frame: before that the object is
+ * still being filled in and every field moves.
+ */
+static void kernel_error_watch(void)
+{
+    extern unsigned long nv2a_gl_progress(void) __attribute__((weak));
+    static uint32_t obj, flags;
+    static int armed, dumped;
+    static int changes;
+    uint32_t o, f;
+
+    if (dumped) return;
+    if (!nv2a_gl_progress || !nv2a_gl_progress()) return;
+    o = BRIDGE_MEM32(0x22FCE0u);
+    if (!o) return;
+    f = BRIDGE_MEM32(o + 0x98u);
+
+    if (!armed) {
+        armed = 1;
+        obj = o; flags = f;
+        fprintf(stderr, "  [ERROR] watching the app object %08X; flags at "
+                        "+0x98 start at %08X\n", o, f);
+        return;
+    }
+    if (o != obj) {
+        fprintf(stderr, "  [ERROR] the app object moved: %08X -> %08X\n", obj, o);
+        obj = o; flags = f;
+        return;
+    }
+    if (f == flags) return;
+
+    if (changes < 24)
+        fprintf(stderr, "  [ERROR] app flags +0x98: %08X -> %08X\n", flags, f);
+    changes++;
+    flags = f;
+    if (!(f & 0x400000u)) return;
+
+    dumped = 1;
+    fprintf(stderr, "\n  [ERROR] the fatal bit 0x400000 has been set; full "
+                    "state at that moment:\n");
+    kernel_error_object_hex();
+    kthread_report();
+    kthread_stacks();
+    fflush(stderr);
+}
+
 static void kernel_freeze_watch(void)
 {
     extern unsigned long nv2a_gl_progress(void) __attribute__((weak));
     static unsigned long last_frames;
-    static long long since, said;
+    static long long since, said, boot_since;
+    static int stacks_said;
     long long now = (long long)GetTickCount64();
     unsigned long frames;
 
     if (!nv2a_gl_progress) return;
     frames = nv2a_gl_progress();
+
+    /*
+     * Before the first picture the boot is legitimately slow -- the loader,
+     * the cache and the sound banks all run before anything is shown -- so
+     * while no frame has been presented, report the state and stop. No stack
+     * dump here: it runs inside this loop, which is the kernel's timer loop
+     * and therefore where the title's deferred work runs, and the run of
+     * 21 Oct showed what that costs -- the loop held still for thirty seconds
+     * printing, the title never got the DPCs it was waiting for, and it wrote
+     * JSRF_FATAL.ERR after the first sound bank instead of loading on. The
+     * clock is in kernel_progress_line: [TIME] 15086 ms, then [TIME] 45253 ms.
+     */
+    if (!frames) {
+        if (!boot_since) boot_since = now;
+        if (now - boot_since < 10000) return;
+        if (said && now - said < 10000) return;
+        said = now;
+        fprintf(stderr, "\n  [FROZEN] no picture yet, %lld ms into the run; "
+                        "still loading. Every guest thread:\n",
+                now - boot_since);
+        kthread_report();
+        return;
+    }
     if (!since || frames != last_frames) {
-        last_frames = frames; since = now; said = 0;
+        last_frames = frames; since = now; said = 0; stacks_said = 0;
         return;
     }
     if (now - since < 4000) return;
@@ -7197,6 +8059,13 @@ static void kernel_freeze_watch(void)
                         "the title's ISR\n", g_apu_raised, g_apu_claimed);
     }
     kthread_report();
+    /* Fifteen seconds, not the four that print the table: a stall that has
+     * lasted this long is not a load in progress. */
+    if (!stacks_said && now - since >= 15000) {
+        stacks_said = 1;
+        kernel_error_object_hex();
+        kthread_stacks();
+    }
 #ifdef __APPLE__
     {   long i, n = g_kthread_n;
         for (i = 0; i < n; i++)
@@ -7281,6 +8150,7 @@ static void kernel_thunk_dispatch(void)
         KThreadState *k = kthread_slot();
         k->ordinal = (uint32_t)ordinal;
         k->caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+        k->esp = g_esp ? g_esp + 4u : 0u;
         k->entered_ms = (long long)GetTickCount64();
         k->left_ms = 0;
         k->calls++;
@@ -7372,14 +8242,30 @@ static void kernel_thunk_dispatch(void)
              * a critical section, for two seconds together. */
             {
                 extern void w32_handoff_report(void) __attribute__((weak));
+                extern void w32_thread_report(void) __attribute__((weak));
                 static int said;
                 int stuck = kthread_all_stuck_ms();
                 if (stuck >= 2000 && said < 3) {
                     said++;
+                    g_bt_epoch++;
                     fprintf(stderr, "  [STALL] every guest thread has been "
                             "blocked or spinning for %d ms -- this is the "
                             "loading-screen hang, not slow loading\n", stuck);
                     if (w32_handoff_report) w32_handoff_report();
+                    if (w32_thread_report) w32_thread_report();
+                    fprintf(stderr, "  [APC] queued %lu, delivered %lu, "
+                            "still pending %lu\n",
+                            g_apc_queued, g_apc_delivered, g_apc_pending);
+                    fprintf(stderr, "  [CRI] lock ctr=%d saved=%d boost=%d "
+                            "idle=%d server=%08X flag=%d selfprio=%d\n",
+                            (int32_t)BRIDGE_MEM32(CRI_LOCK_CTR),
+                            (int32_t)BRIDGE_MEM32(CRI_LOCK_SAVED),
+                            (int32_t)BRIDGE_MEM32(CRI_LOCK_BOOST),
+                            (int32_t)BRIDGE_MEM32(CRI_LOCK_IDLE),
+                            BRIDGE_MEM32(CRI_LOCK_SERVER),
+                            (int32_t)BRIDGE_MEM32(CRI_LOCK_FLAG),
+                            (int)GetThreadPriority((HANDLE)(LONG_PTR)-2));
+                    fflush(stderr);
                 }
                 if (stuck < 2000) said = 0;
             }
@@ -7470,8 +8356,11 @@ static void kernel_thunk_dispatch(void)
         static uint8_t warned[XBOX_KERNEL_THUNK_TABLE_SIZE];
         if (!warned[slot]) {
             warned[slot] = 1;
-            fprintf(stderr, "  [KERNEL] WARNING: no bridge for ordinal %u (slot %d), returning 0\n",
-                    ordinal, slot);
+            fprintf(stderr, "  [KERNEL] WARNING: no bridge for ordinal %u (slot %d), returning 0"
+                    " -- called from guest %08X, args %08X %08X %08X %08X\n",
+                    ordinal, slot, BRIDGE_MEM32(g_esp), BRIDGE_MEM32(g_esp + 4),
+                    BRIDGE_MEM32(g_esp + 8), BRIDGE_MEM32(g_esp + 12),
+                    BRIDGE_MEM32(g_esp + 16));
             /* "Returning 0" is the harmless half. The damaging half is the
              * stack: the Xbox kernel is stdcall, so the callee owes the caller
              * its arguments back, and an ordinal missing from

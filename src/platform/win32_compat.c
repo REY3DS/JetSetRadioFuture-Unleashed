@@ -858,6 +858,37 @@ static void handoff_note(char op, DWORD target, int count)
     pthread_mutex_unlock(&g_handoff_lock);
 }
 
+/* Every thread object, and what its suspend state says.
+ *
+ * The hand-off log says who suspended and who resumed; this says what the
+ * threads themselves are left holding. A worker parked with a suspend count
+ * above zero and no pending resume is one that nothing will ever wake, and
+ * that is a different failure from one that is merely blocked in a wait.
+ */
+void w32_thread_report(void)
+{
+    size_t i;
+    long long now = (long long)GetTickCount64();
+
+    fprintf(stderr, "  [SUSPEND] thread objects: suspend count, pending resume,"
+                    " parked\n");
+    pthread_mutex_lock(&g_obj_set_lock);
+    for (i = 0; i < W32_OBJ_SET; i++) {
+        w32_object *o = (w32_object *)g_obj_set[i];
+        if (!o || o->kind != K_THREAD)
+            continue;
+        fprintf(stderr, "  [SUSPEND]   tid %-5lu suspend %d pending %d"
+                        " parked %d%s%lld ms  exited %d\n",
+                (unsigned long)o->tid, (int)o->suspend_count,
+                (int)o->pending_resume, (int)o->parked,
+                o->park_since ? " for " : "",
+                o->park_since ? now - o->park_since : 0LL,
+                o->exited);
+    }
+    pthread_mutex_unlock(&g_obj_set_lock);
+    fflush(stderr);
+}
+
 /* Printed by the stall report. Oldest first, newest last. */
 void w32_handoff_report(void)
 {
@@ -1064,6 +1095,26 @@ int w32_suspend_pending(void)
 void w32_suspend_checkpoint(void)
 {
     w32_object *o = t_self_obj;
+    /* Whether a suspend aimed at another thread actually parks it.
+     *
+     * The title drives its CRI thread server with ResumeThread/SuspendThread
+     * as a hand-off: the client resumes the server, the server runs the job
+     * and suspends itself again. On one CPU that is atomic; here the client
+     * runs on to the next resume while the server has not been scheduled, and
+     * the counted suspends stop adding up to zero. The server then never runs
+     * again, and the client ends up released in a loop of its own.
+     *
+     * Turned off, nothing stops and the server simply runs whenever it is
+     * scheduled. That is the older, less faithful behaviour -- kept behind a
+     * switch so both can be measured on the same build. */
+    { static int park_on = -1;
+      if (park_on < 0) {
+          const char *e = getenv("RECOMP_SUSPEND_PARK");
+          park_on = !(e && !strcmp(e, "0"));
+          fprintf(stderr, "  [THREAD] suspends %s park their target\n",
+                  park_on ? "do" : "do not");
+      }
+      if (!park_on) return; }
     if (!o) return;
     pthread_mutex_lock(&o->lock);
     if (o->suspend_count > 0) {
