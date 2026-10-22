@@ -227,6 +227,8 @@ void xbox_nv2a_hurry(int on) { (void)on; }
  * that is not listed still hangs -- run the title and the watchdog sample will
  * name the register.
  */
+static unsigned long g_ack_clears[8];   /* per NV2A_ACK entry, for a report */
+
 static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
     { 0x100410, 0x00010000u },  /* PFB flush kick, Halo 0x001EF930 */
 
@@ -674,10 +676,77 @@ void xbox_nv2a_vblank_service(void)
     if (g_nv2a_memory) vblank_intr_tick((volatile uint32_t *)g_nv2a_memory);
 }
 
+/* What the vblank handshake looks like from inside the model.
+ *
+ * A title acknowledges the display interrupt by writing one to PCRTC_INTR_0 and
+ * then spins until PMC_INTR_0 says the source is quiet. That works only if the
+ * busy-bit thread gets to run between the write and the next look, and a title
+ * that stands still in the spin is the one case worth reporting: the two words
+ * it reads, the pending marker that tells this thread to wait for the title's
+ * acknowledgement, and whether a software method is holding PGRAPH.
+ *
+ * Called from the spin report, on the thread that is spinning. */
+unsigned xbox_nv2a_intr_report(uint32_t base, char *out, unsigned cap)
+{
+    volatile uint32_t *pcrtc = (volatile uint32_t *)(uintptr_t)(base + 0x600100u);
+    volatile uint32_t *pmc   = (volatile uint32_t *)(uintptr_t)(base + 0x000100u);
+    volatile uint32_t *pg    = (volatile uint32_t *)(uintptr_t)(base + 0x400100u);
+    (void)pg;
+    if (!g_nv2a_memory)
+        return 0;
+    {
+        volatile uint32_t *r = (volatile uint32_t *)g_nv2a_memory;
+        extern int xbox_nv2a_swm_in_flight(void);
+        extern unsigned long g_vblank_count;
+        snprintf(out, cap,
+                 "model: regs %p PCRTC_INTR_0 %08X PMC_INTR_0 %08X "
+                 "PGRAPH_INTR %08X PCI_FLUSH %08X swm %d vblank %lu "
+                 "clears flush %lu intr %lu",
+                 (void *)r,
+                 (unsigned)*(volatile uint32_t *)((char *)r + 0x600100),
+                 (unsigned)*(volatile uint32_t *)((char *)r + 0x000100),
+                 (unsigned)*(volatile uint32_t *)((char *)r + 0x400100),
+                 (unsigned)*(volatile uint32_t *)((char *)r + 0x100410),
+                 xbox_nv2a_swm_in_flight(), g_vblank_count,
+                 g_ack_clears[0], g_ack_clears[3]);
+        (void)pcrtc; (void)pmc;
+    }
+    return 1;
+}
+
+/* Where the busy-bit thread is, for the report. Same reason as the tick
+ * thread's: when this one stops, the title spins on a bit that reads set
+ * forever, and the bit it is spinning on is the only thing a spin dump shows.
+ * The push-buffer scan below is the one step here that runs guest-built
+ * commands, and the one worth naming. */
+static volatile const char *s_ack_stage = "start";
+static volatile long long s_ack_stage_ms;
+static volatile unsigned long s_ack_beat;
+static volatile uint32_t s_ack_tag;
+
+#define ACK_STAGE(name) do { \
+        s_ack_stage = (name); \
+        s_ack_stage_ms = (long long)GetTickCount64(); \
+    } while (0)
+#define ACK_STAGE_TAG(name, va) do { \
+        s_ack_tag = (uint32_t)(va); \
+        ACK_STAGE(name); \
+    } while (0)
+
+const char *xbox_nv2a_ack_stage(long long *ms, unsigned long *beat, uint32_t *tag)
+{
+    if (ms)  *ms  = s_ack_stage_ms;
+    if (beat) *beat = s_ack_beat;
+    if (tag) *tag = s_ack_tag;
+    return (const char *)s_ack_stage;
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        s_ack_beat++;
+        ACK_STAGE("vblank ack");
         vblank_intr_tick(regs);
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
@@ -689,6 +758,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 continue;
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
+                g_ack_clears[i]++;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
@@ -707,11 +777,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *get = *put;
             }
         }
+        ACK_STAGE("fences");
         fence_mirrors_tick();
+        ACK_STAGE("counters");
         counter_mirrors_tick();
+        ACK_STAGE("frame counters");
         frame_counters_tick();
+        ACK_STAGE("framebuffer probe");
         framebuffer_probe_tick();
 
+        ACK_STAGE("pushbuffer trace");
         /* Which framebuffer the display would be scanning out.
          *
          * PCRTC_START holds the address the CRTC reads pixels from, so

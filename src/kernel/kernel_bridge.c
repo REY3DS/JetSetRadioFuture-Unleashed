@@ -2159,6 +2159,32 @@ static void bridge_HalReadSMCTrayState(void)
  * mattered for anything here yet; when it does, the upgrade is a real queue
  * drained by the thread that lowered IRQL, not a second call site.
  */
+/* Where the two host servers are, for the report.
+ *
+ * The GPU model and the interrupt/timer server are host threads, so no guest
+ * stack can say what either is doing -- and when one of them stops, everything
+ * downstream stops with it: this thread runs DPC routines while holding the
+ * guest lock, so a DPC that does not return freezes every guest thread, and a
+ * busy-bit thread that stops leaves the title spinning on a bit nothing will
+ * clear. Both failures used to be visible only as "the picture stopped".
+ *
+ * Each server names the step it is in and when it got there. Nothing calls
+ * these on the hot path beyond a store and a clock read.
+ */
+volatile const char *g_tick_stage = "start";
+volatile long long   g_tick_stage_ms;
+volatile unsigned long g_tick_beat;
+volatile uint32_t    g_tick_tag;
+
+#define TICK_STAGE(name) do { \
+        g_tick_stage = (name); \
+        g_tick_stage_ms = (long long)GetTickCount64(); \
+    } while (0)
+#define TICK_STAGE_TAG(name, va) do { \
+        g_tick_tag = (uint32_t)(va); \
+        TICK_STAGE(name); \
+    } while (0)
+
 /* Run a DPC's deferred routine on the calling thread.
  *
  * VOID DeferredRoutine(PKDPC, PVOID Context, PVOID Arg1, PVOID Arg2),
@@ -2202,6 +2228,10 @@ static int kernel_run_dpc_locked(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     { extern void xbox_waitlog_dpc(uint32_t routine) __attribute__((weak));
       if (xbox_waitlog_dpc) xbox_waitlog_dpc(routine); }
 
+    /* A DPC runs guest code with the guest lock held, on this thread. If it
+     * never returns, this thread is the reason every other guest thread is
+     * stuck inside a bridge call -- so it must be able to say which routine. */
+    TICK_STAGE_TAG("dpc routine", routine);
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
 
@@ -2741,6 +2771,7 @@ static void kernel_drain_dpcs(void)
         LONG head = g_dpc_head;
         PendingDpc d = g_dpc_queue[head];
         g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
+        TICK_STAGE_TAG("dpc queued", d.dpc);
         kernel_run_dpc(d.dpc, d.arg1, d.arg2);
     }
 }
@@ -2940,6 +2971,33 @@ static int g_timer_started;
 
 static void kernel_progress_line(void);
 
+/* What the two host servers are doing, for a spin report.
+ * Reads only; safe from a thread that does not hold the guest lock, which is
+ * exactly the thread that needs it. */
+void xbox_host_server_report(void)
+{
+    extern const char *xbox_nv2a_ack_stage(long long *ms, unsigned long *beat,
+                                          uint32_t *tag);
+    long long now = (long long)GetTickCount64();
+    const char *st = (const char *)g_tick_stage;
+    unsigned    conn = (unsigned)xbox_GetConnectedInterrupt(NV2A_VECTOR);
+    fprintf(stderr, "  [SERVER] tick thread: beat %lu, stage \"%s\" 0x%08X "
+                    "for %lld ms\n",
+            g_tick_beat, st ? st : "?", (unsigned)g_tick_tag,
+            g_tick_stage_ms ? now - g_tick_stage_ms : -1);
+    {
+        long long ams = 0; unsigned long abeat = 0; uint32_t atag = 0;
+        const char *as = xbox_nv2a_ack_stage(&ams, &abeat, &atag);
+        fprintf(stderr, "  [SERVER] nv2a ack thread: beat %lu, stage \"%s\" "
+                        "0x%08X for %lld ms\n",
+                abeat, as ? as : "?", (unsigned)atag,
+                ams ? now - ams : -1);
+    }
+    fprintf(stderr, "  [SERVER] vblanks %lu, vector 3 connected %u\n",
+            g_vblank_count, conn);
+    fflush(stderr);
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -3039,14 +3097,24 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 prev_valid = 1;
             }
         }
+        g_tick_beat++;
+        TICK_STAGE("progress line");
         kernel_progress_line(); /* one line a second, so the log has a clock */
+        TICK_STAGE("freeze watch");
         kernel_freeze_watch(); /* has the picture stopped? */
+        TICK_STAGE("error watch");
         kernel_error_watch();  /* did the title's error flags just move? */
+        TICK_STAGE("vblank");
         kernel_vblank_tick();  /* the GPU's frame clock */
+        TICK_STAGE("pgraph");
         kernel_pgraph_tick();  /* the GPU's software methods */
+        TICK_STAGE("apu");
         kernel_apu_tick();     /* the APU's interrupt line */
+        TICK_STAGE("cvfs");
         kernel_cvfs_watch();   /* CRI's streaming file device */
+        TICK_STAGE("dpc drain");
         kernel_drain_dpcs();   /* deferred work, before due timers */
+        TICK_STAGE("timers");
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -3067,8 +3135,10 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
             /* Outside the lock: the routine can set or cancel timers. */
             xbox_dispatcher_signal(g_timers[i].timer_va ? g_timers[i].timer_va : timer_va_fired);
-            if (dpc)
+            if (dpc) {
+                TICK_STAGE_TAG("timer dpc", dpc);
                 kernel_run_dpc(dpc, 0, 0);
+            }
         }
     }
 }
@@ -6757,6 +6827,76 @@ static void kernel_progress_line(void)
             g_read_calls, (unsigned long)g_lock_owner,
             g_lock_since ? now - g_lock_since : 0, (int)g_lock_waiters);
     fflush(stderr);
+
+    /* When the picture stops, the two host servers are the first suspects:
+     * neither has a guest stack to sample, and the tick thread runs deferred
+     * routines while holding the guest lock. Say what both are doing for as
+     * long as the stall lasts -- once the guest threads are all parked, these
+     * three lines are the only account of the runtime that is still moving. */
+    {
+        static long long stalled_since, stall_said;
+        if (frames != last_frames) {
+            stalled_since = 0;
+        } else if (!stalled_since) {
+            stalled_since = now;
+        } else if (now - stalled_since >= 3000 && now - stall_said >= 5000) {
+            stall_said = now;
+            fprintf(stderr, "  [SERVER] the picture has not moved for %lld ms\n",
+                    now - stalled_since);
+            xbox_host_server_report();
+        }
+    }
+
+    /* The title's push buffer, once a second, on request.
+     *
+     * D3D keeps its own idea of how much of the ring the GPU has consumed: a
+     * dword in the title's memory, at the address the device object holds in
+     * its field 0x34. A submit waits for that dword to pass the entry it is
+     * about to write -- and when the wait never ends, the only question worth
+     * asking is whether the dword stopped moving, and when. The channel base
+     * matters too: a request of 32 KB or more installs a software channel from
+     * the driver's own data before submitting, and reads of the ring afterwards
+     * go to whichever base the device holds.
+     *
+     * RECOMP_PB_WATCH=1 turns it on. It prints on change, so the steady state
+     * costs nothing and a stall shows as the last sample. */
+    {
+        static int on = -1;
+        static uint32_t prev[8];
+        static int had;
+        if (on < 0) { const char *e = getenv("RECOMP_PB_WATCH"); on = e && *e == '1'; }
+        if (on) {
+            uint32_t dev = BRIDGE_MEM32(0x0019DCE0);
+            if (dev >= 0x00010000u && dev < 0x84000000u) {
+                uint32_t v[8], i, changed = 0;
+                uint32_t end = BRIDGE_MEM32(dev + 0x30);
+                uint32_t pget = BRIDGE_MEM32(dev + 0x34);
+                uint32_t chan = BRIDGE_MEM32(dev + 0x2264);
+                v[0] = BRIDGE_MEM32(dev);            /* the ring's PUT */
+                v[1] = end;
+                v[2] = pget;
+                v[3] = (pget >= 0x00010000u && pget < 0x84000000u)
+                     ? BRIDGE_MEM32(pget) : 0;       /* shadow GET */
+                v[4] = chan;
+                v[5] = (chan >= 0x00010000u && chan < 0x84000000u)
+                     ? BRIDGE_MEM32(chan + 0x40) : 0;
+                v[6] = (chan >= 0x00010000u && chan < 0x84000000u)
+                     ? BRIDGE_MEM32(chan + 0x44) : 0;
+                v[7] = BRIDGE_MEM32(0x80000000u);
+                for (i = 0; i < 8; i++) if (!had || v[i] != prev[i]) changed = 1;
+                if (changed) {
+                    fprintf(stderr, "  [PB] dev %08X put %08X end %08X "
+                                    "shadow %08X -> %08X chan %08X put %08X "
+                                    "get %08X  lin0 %08X\n",
+                            dev, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+                    fflush(stderr);
+                }
+                for (i = 0; i < 8; i++) prev[i] = v[i];
+                had = 1;
+            }
+        }
+    }
+
     last = now; last_read = g_read_bytes; last_frames = frames;
     kernel_app_state_line();
     xbox_load_step_watch();

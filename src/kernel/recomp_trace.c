@@ -219,6 +219,65 @@ void recomp_slice_site(uint32_t site_va)
                         "esp=0x%08X, for %lld ms with no call out of it\n",
                 (unsigned long)GetCurrentThreadId(), site_va, esp,
                 now - standing_since);
+        /* The registers say what the loop is testing. A back edge keeps the
+         * values it tests in one of them, and the address formed from it names
+         * the register or the word the thread is waiting on -- the one piece
+         * of a spin that a stack dump cannot show. */
+        fprintf(stderr, "  [SPIN]   eax %08X ebx %08X ecx %08X edx %08X "
+                        "esi %08X edi %08X esp %08X\n",
+                g_eax, g_ebx, g_ecx, g_edx, g_esi, g_edi, g_esp);
+        {
+            /* The word each register points at. A spin is a test of memory,
+             * and the registers hold the address of the memory -- so one
+             * level of dereference turns "looped back to 0x..." into "the
+             * counter it is waiting on says N". Only words that could be a
+             * guest address are followed: image, heap, or the linear alias. */
+            uint32_t regs[6], i;
+            regs[0] = g_eax; regs[1] = g_ebx; regs[2] = g_ecx;
+            regs[3] = g_edx; regs[4] = g_esi; regs[5] = g_edi;
+            for (i = 0; i < 6; i++) {
+                uint32_t a = regs[i];
+                void *h;
+                if (a & 3u) continue;
+                if (!((a >= 0x00010000u && a < 0x04000000u) ||
+                      (a >= 0x80000000u && a < 0x84000000u)))
+                    continue;
+                h = xbox_HostPtr(a);
+                if (!h) continue;
+                fprintf(stderr, "  [SPIN]   [%08X] %08X\n", a,
+                        *(volatile uint32_t *)h);
+            }
+        }
+        { extern void xbox_host_server_report(void);
+          xbox_host_server_report(); }
+        {
+            /* The NV2A register block, if a register holds it: say what the
+             * words a handshake reads say, and what the model thinks of them.
+             * The base arrives in whichever register the routine loaded it
+             * into, and that changes with the handshake -- the flush kick
+             * keeps it in eax, the display acknowledge in ebx. */
+            extern unsigned xbox_nv2a_intr_report(uint32_t base, char *out,
+                                                 unsigned cap);
+            uint32_t cand[2], k;
+            cand[0] = g_eax; cand[1] = g_ebx;
+            for (k = 0; k < 2; k++) {
+                uint32_t b = cand[k];
+                if (b < 0xFD000000u || b >= 0xFE000000u) continue;
+                fprintf(stderr, "  [SPIN]   nv2a base %08X: "
+                                "[%08X] %08X  [%08X] %08X  [%08X] %08X\n",
+                        b,
+                        b + 0x100u,
+                        *(volatile uint32_t *)xbox_HostPtr(b + 0x100u),
+                        b + 0x100410u,
+                        *(volatile uint32_t *)xbox_HostPtr(b + 0x100410u),
+                        b + 0x600100u,
+                        *(volatile uint32_t *)xbox_HostPtr(b + 0x600100u));
+                {   char line[260];
+                    if (xbox_nv2a_intr_report(b, line, (unsigned)sizeof line))
+                        fprintf(stderr, "  [SPIN]   %s\n", line);
+                }
+            }
+        }
         for (j = 0; j < 24; j++) {
             uint32_t a = esp + (uint32_t)j * 4u;
             if (a < 0x00010000u || a >= 0x04000000u) break;

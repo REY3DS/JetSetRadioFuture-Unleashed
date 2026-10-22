@@ -332,9 +332,9 @@ int nv_switch_main(int argc, char **argv, int (*host)(void))
      * ago logs the same first line as today's. This one changes whenever the
      * diagnostics do: if it is missing from the log, the card is running an
      * older .nro and nothing else in the run means anything. */
-    fprintf(stderr, "[SWITCH] diagnostic build 25: a priority raise issued by "
-                    "an already-raised thread can be read as the restore it is "
-                    "meant to be (RECOMP_PRIO_RESTORE=1 to try it)\n");
+    fprintf(stderr, "[SWITCH] diagnostic build 31: RECOMP_PB_WATCH=1 reports "
+                    "the push buffer's end, its shadow consume pointer and the "
+                    "channel it is using, once a second on change\n");
 
     call.host = host;
     call.rc = 1;
