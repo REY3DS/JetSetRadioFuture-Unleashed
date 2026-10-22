@@ -1133,6 +1133,31 @@ void w32_suspend_checkpoint(void)
     pthread_mutex_unlock(&o->lock);
 }
 
+/* A thread that suspends ITSELF is not parked here.
+ *
+ * The count still goes up, so a ResumeThread from another thread balances it
+ * exactly as before -- but the caller keeps running instead of waiting for a
+ * resume that, measured on this title, does not always come. Three runs in a
+ * row ended at 43,982 KB of the load with tid 1009 inside NtSuspendThread and
+ * every other thread idle for 85 seconds, and that thread was the one that
+ * had done the suspending.
+ *
+ * What it costs: the hand-off becomes a spin rather than a park, which is the
+ * older and less faithful behaviour. What it buys: a loader that finishes.
+ * RECOMP_SUSPEND_SELF=1 restores the park for A/B. */
+static int self_suspend_should_park(w32_object *o)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_SUSPEND_SELF") ? 1 : 0;
+    if (!on) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [THREAD] self-suspend counted, not parked "
+                            "(tid %u)\n", (unsigned)o->tid);
+    }
+    return on;
+}
+
 DWORD SuspendThread(HANDLE h)
 {
     /* Suspending ANOTHER thread mid-run is not supported on POSIX; only the
@@ -1165,7 +1190,7 @@ DWORD SuspendThread(HANDLE h)
         return prev;
     }
     o->suspend_count++;
-    if (o == self_obj()) {
+    if (o == self_obj() && self_suspend_should_park(o)) {
         o->parked = 1;
         o->park_since = (long long)GetTickCount64();
         pthread_mutex_unlock(&o->lock);
