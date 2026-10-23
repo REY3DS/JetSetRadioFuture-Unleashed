@@ -216,9 +216,109 @@ typedef struct {
     volatile uint32_t esp;
     volatile long long ms;
     volatile unsigned long long n;
+    volatile long long sampled_ms;   /* last look the profiler took, 0 = never */
 } SliceSeen;
 static SliceSeen g_slice_seen[SLICE_SLOTS];
 static RECOMP_TLS SliceSeen *t_slice_seen;
+
+/* A profiler made of the spin notes.
+ *
+ * The loading screen in this title reads one 126 KB chunk every ten seconds
+ * and then sits in guest code: no kernel call, no wait the kernel can see, no
+ * stall for the detector to fire on. The one thing the port already knows
+ * about a thread doing that is the note slice_note() writes -- the address of
+ * the loop back edge it last came round and the time it got there.
+ *
+ * Sampling that table from the timer thread once a millisecond is a profiler.
+ * A thread that is running moves its note thousands of times a second; one
+ * that is parked or starved does not move it at all. So each sample answers
+ * two questions at once: was this thread running, and if so, in which loop.
+ * Counting only the samples where the note moved is what makes the second
+ * number a distribution of work rather than of waiting.
+ *
+ * RECOMP_PROFILE=1 turns it on; nothing is printed until it is.
+ */
+#define SLICE_PROF_THREADS 8
+#define SLICE_PROF_SITES   6
+
+static struct {
+    unsigned long long tid;
+    unsigned long long seen;
+    unsigned long long active;
+    struct {
+        uint32_t va;
+        unsigned long long hits;
+    } site[SLICE_PROF_SITES];
+} g_sprof[SLICE_PROF_THREADS];
+
+static void sprof_site_hit(int t, uint32_t va)
+{
+    int k;
+    for (k = 0; k < SLICE_PROF_SITES; k++) {
+        if (g_sprof[t].site[k].va == va) { g_sprof[t].site[k].hits++; return; }
+        if (!g_sprof[t].site[k].va) {
+            g_sprof[t].site[k].va = va;
+            g_sprof[t].site[k].hits = 1;
+            return;
+        }
+    }
+    /* More distinct loops than slots: the rarest ones are dropped, which is
+     * what the report is not about. */
+}
+
+void recomp_slice_sample(void)
+{
+    int i;
+    for (i = 0; i < SLICE_SLOTS; i++) {
+        SliceSeen *s = &g_slice_seen[i];
+        unsigned long long tid = s->tid;
+        int t;
+        if (!tid) continue;
+        for (t = 0; t < SLICE_PROF_THREADS; t++) {
+            if (g_sprof[t].tid == tid) break;
+            if (!g_sprof[t].tid) {
+                g_sprof[t].tid = tid;
+                g_sprof[t].seen = g_sprof[t].active = 0;
+                memset(g_sprof[t].site, 0, sizeof g_sprof[t].site);
+                break;
+            }
+        }
+        if (t >= SLICE_PROF_THREADS) continue;
+        g_sprof[t].seen++;
+        if (s->sampled_ms == s->ms) continue;      /* did not move since last look */
+        s->sampled_ms = s->ms;
+        g_sprof[t].active++;
+        sprof_site_hit(t, s->va);
+    }
+}
+
+void recomp_slice_profile_report(void)
+{
+    int t, k;
+    for (t = 0; t < SLICE_PROF_THREADS; t++) {
+        unsigned long long act = g_sprof[t].active;
+        if (!g_sprof[t].tid || !g_sprof[t].seen) continue;
+        fprintf(stderr, "  [PROF] tid %-6llu running %5.1f%% of samples (%llu)",
+                g_sprof[t].tid,
+                100.0 * (double)act / (double)g_sprof[t].seen, act);
+        for (k = 0; k < SLICE_PROF_SITES && act; k++) {
+            int b = -1, j;
+            for (j = 0; j < SLICE_PROF_SITES; j++)
+                if (g_sprof[t].site[j].va && g_sprof[t].site[j].hits
+                 && (b < 0 || g_sprof[t].site[j].hits > g_sprof[t].site[b].hits))
+                    b = j;
+            if (b < 0) break;
+            fprintf(stderr, "%s 0x%08X %.0f%%", k ? " |" : "   loops:",
+                    g_sprof[t].site[b].va,
+                    100.0 * (double)g_sprof[t].site[b].hits / (double)act);
+            g_sprof[t].site[b].hits = 0;
+        }
+        fprintf(stderr, "\n");
+        g_sprof[t].seen = g_sprof[t].active = 0;
+        for (k = 0; k < SLICE_PROF_SITES; k++) g_sprof[t].site[k].va = 0;
+    }
+    fflush(stderr);
+}
 
 static void slice_note(uint32_t va, uint32_t esp)
 {

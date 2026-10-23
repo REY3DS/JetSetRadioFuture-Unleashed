@@ -2992,6 +2992,22 @@ void xbox_host_server_report(void)
                         "0x%08X for %lld ms\n",
                 abeat, as ? as : "?", (unsigned)atag,
                 ams ? now - ams : -1);
+        /* Where in the title's command stream that thread is. The stage above
+         * says which step has not returned; this says whether a single
+         * method is the one that has not. */
+        {
+            extern volatile uint32_t g_pb_walk_va, g_pb_cur_va,
+                                     g_pb_cur_method, g_pb_cur_param;
+            extern volatile long long g_pb_walk_ms;
+            fprintf(stderr, "  [SERVER] pushbuffer: walk %08X (%lld ms) | "
+                            "last method %08X subch %u method %03X param %08X\n",
+                    (unsigned)g_pb_walk_va,
+                    g_pb_walk_ms ? now - g_pb_walk_ms : 0,
+                    (unsigned)g_pb_cur_va,
+                    (unsigned)((g_pb_cur_method >> 13) & 7u),
+                    (unsigned)(g_pb_cur_method & 0x1FFCu),
+                    (unsigned)g_pb_cur_param);
+        }
     }
     fprintf(stderr, "  [SERVER] vblanks %lu, vector 3 connected %u\n",
             g_vblank_count, conn);
@@ -3030,6 +3046,21 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
 
         Sleep(1);
+        /* One look at the profiler table per tick. Cheap enough to leave on
+         * the same loop: sixteen entries, one comparison each. */
+        { extern void recomp_slice_sample(void);
+          static int prof = -1;
+          if (prof < 0) prof = getenv("RECOMP_PROFILE") ? 1 : 0;
+          if (prof) recomp_slice_sample(); }
+        /* The GPU this port emulates pays its vblank and clears its busy bits
+         * from one thread, and that thread also runs the title's pushbuffer
+         * methods, so a slow method there stops the clock for the whole
+         * machine: the main thread spins on PFIFO_CACHE1_STATUS and the
+         * vblank thread on PMC_INTR_0. Hardware does not depend on a CPU
+         * thread for either, so neither does this: if the ack thread has been
+         * inside one stage for longer than a beat should take, pay the bills
+         * from here. Cheap when all is well -- one tick compare. */
+        { extern void xbox_nv2a_ack_rescue(void); xbox_nv2a_ack_rescue(); }
         /*
          * RECOMP_TABLE_WATCH=<addr>,<bytes>,<stride>: catch a pointer table
          * going bad at the moment it goes bad.
@@ -6836,6 +6867,37 @@ static void kernel_progress_line(void)
     if (!started) { started = last = now; last_read = g_read_bytes; return; }
     if (now - last < 1000) return;
     secs = (double)(now - last) / 1000.0;
+
+    { extern void recomp_slice_profile_report(void);
+      static int prof = -1;
+      static long long last_prof;
+      if (prof < 0) prof = getenv("RECOMP_PROFILE") ? 1 : 0;
+      if (prof && now - last_prof >= 10000) {
+          last_prof = now;
+          recomp_slice_profile_report();
+      } }
+
+    /* RECOMP_STACKS_MS=<n>: raise the stack epoch every n ms.
+     *
+     * Ten seconds is enough for every thread that calls the kernel to be seen
+     * at least once per epoch; shorter intervals turn the log into stacks and
+     * nothing else. */
+    {
+        static long long last_raise;
+        static int iv = -1;
+        if (iv < 0) {
+            const char *e = getenv("RECOMP_STACKS_MS");
+            iv = e ? atoi(e) : 0;
+            if (iv) fprintf(stderr, "  [STACKS] every %d ms, each guest "
+                                    "thread dumps its stack once\n", iv);
+        }
+        if (iv > 0 && now - last_raise >= iv) {
+            last_raise = now;
+            g_bt_epoch++;
+            fprintf(stderr, "  [STACKS] epoch %d\n", (int)g_bt_epoch);
+            fflush(stderr);
+        }
+    }
     frames = nv2a_gl_progress ? nv2a_gl_progress() : 0;
     fprintf(stderr, "  [TIME] %7lld ms  frames %lu (+%.1f/s)  "
                     "read %llu KB (+%.0f KB/s, %llu calls)  "
@@ -8433,6 +8495,23 @@ static void kernel_thunk_dispatch(void)
         k->entered_ms = (long long)GetTickCount64();
         k->left_ms = 0;
         k->calls++;
+    }
+
+    /* Answer a stack epoch raised by another thread.
+     *
+     * The [STALL] detector raises one and each thread dumps at its next call
+     * out; that only fires when every thread is stuck at once. A loader that
+     * is slow rather than stuck -- which is what the loading screen looks like
+     * when it is one read every twelve seconds -- never gets there, and its
+     * guest stack is the one thing the rest of the report cannot show. So the
+     * epoch can also be raised on a timer; one dump per thread per epoch, on
+     * threads that are actually calling the kernel. */
+    if (g_bt_epoch && t_bt_epoch != g_bt_epoch) {
+        char who[64];
+        t_bt_epoch = g_bt_epoch;
+        snprintf(who, sizeof who, "tid %lu at ordinal %u (epoch %d)",
+                 (unsigned long)GetCurrentThreadId(), ordinal, (int)g_bt_epoch);
+        guest_stack_trace(who, 12);
     }
 
     if (KERNEL_LOG_ON()) {

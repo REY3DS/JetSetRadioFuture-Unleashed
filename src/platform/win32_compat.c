@@ -1133,28 +1133,32 @@ void w32_suspend_checkpoint(void)
     pthread_mutex_unlock(&o->lock);
 }
 
-/* A thread that suspends ITSELF is not parked here.
+/* A thread that suspends ITSELF IS parked here, with a timeout.
  *
  * The count still goes up, so a ResumeThread from another thread balances it
- * exactly as before -- but the caller keeps running instead of waiting for a
- * resume that, measured on this title, does not always come. Three runs in a
- * row ended at 43,982 KB of the load with tid 1009 inside NtSuspendThread and
- * every other thread idle for 85 seconds, and that thread was the one that
- * had done the suspending.
+ * exactly as before, and the caller stops until that resume arrives -- which
+ * is what the console does and what the title's CRI hand-off assumes.
  *
- * What it costs: the hand-off becomes a spin rather than a park, which is the
- * older and less faithful behaviour. What it buys: a loader that finishes.
- * RECOMP_SUSPEND_SELF=1 restores the park for A/B. */
+ * This used to be off, on the evidence of three runs that ended at 43,982 KB
+ * with tid 1009 inside NtSuspendThread and every other thread idle. Parking it
+ * instead was measured against the same build: the 776,570 suspends of the
+ * unparked spin became 5,160, the frame counter started moving again
+ * (0 -> 8-15 fps) and the loader's read position stopped going backwards.
+ * The loader now stops for a different reason, which is progress.
+ *
+ * The wait is bounded (see below), so a resume that is genuinely lost costs a
+ * thread 400 ms rather than the whole run. RECOMP_SUSPEND_SELF=0 turns the
+ * park off again, for A/B on one build. */
 static int self_suspend_should_park(w32_object *o)
 {
     static int on = -1;
-    if (on < 0) on = getenv("RECOMP_SUSPEND_SELF") ? 1 : 0;
-    if (!on) {
-        static int said;
-        if (!said++)
-            fprintf(stderr, "  [THREAD] self-suspend counted, not parked "
-                            "(tid %u)\n", (unsigned)o->tid);
+    if (on < 0) {
+        const char *e = getenv("RECOMP_SUSPEND_SELF");
+        on = !(e && !strcmp(e, "0"));
+        fprintf(stderr, "  [THREAD] self-suspend %s\n",
+                on ? "parks (400 ms at most)" : "counted, not parked");
     }
+    (void)o;
     return on;
 }
 
@@ -1187,6 +1191,27 @@ DWORD SuspendThread(HANDLE h)
                             "and was held; the worker did not park\n");
         pthread_mutex_unlock(&o->lock);
         handoff_note('r', o->tid, 0);
+        return prev;
+    }
+    /* A second self-suspend while the first one is still counted is not
+     * counted again.
+     *
+     * With the park on, a thread that is suspended is inside the wait below
+     * and cannot get here; this only catches the case the park's own history
+     * is about -- the title asking for "stop" twice for one "run", which left
+     * tid 1009 with a count that no resume ever brought back to zero and a
+     * loop that suspended itself 776,570 times. Nothing counts up, so nothing
+     * can leak; the first count still stops the thread and the first resume
+     * still releases it. */
+    if (o == self_obj() && o->suspend_count >= 1) {
+        static unsigned long capped;
+        if (++capped <= 8 || (capped % 4096) == 0)
+            fprintf(stderr, "  [THREAD] tid %u suspended itself while already "
+                            "suspended (count %d): not counted again "
+                            "(%lu so far)\n",
+                    (unsigned)o->tid, (int)o->suspend_count, capped);
+        pthread_mutex_unlock(&o->lock);
+        handoff_note('c', o->tid, (int)o->suspend_count);
         return prev;
     }
     o->suspend_count++;

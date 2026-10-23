@@ -554,6 +554,14 @@ void xbox_Nv2aReleaseStalledRing(void)
     fence_mirrors_write();
 }
 
+/* See pb_env_on() in nv2a_pb_scan.c: a flag set to "0" is off. */
+static int nv2a_env_on(const char *name, int dflt)
+{
+    const char *e = getenv(name);
+    if (!e || !*e) return dflt;
+    return !(e[0] == '0' && e[1] == 0);
+}
+
 static void fence_mirrors_tick(void)
 {
     /* RECOMP_FENCE_MIRROR=0: leave the fence block to the pushbuffer
@@ -566,7 +574,7 @@ static void fence_mirrors_tick(void)
                     /* Off by default whenever the executor is running: it
                      * writes the real semaphores. On for a run without it,
                      * where nothing else would ever complete a fence. */
-                    on = e ? atoi(e) : (getenv("RECOMP_PB_EXEC") ? 0 : 1); }
+                    on = e ? atoi(e) : !nv2a_env_on("RECOMP_PB_EXEC", 0); }
       if (!on) return; }
     fence_mirrors_write();
 }
@@ -757,13 +765,21 @@ const char *xbox_nv2a_ack_stage(long long *ms, unsigned long *beat, uint32_t *ta
     return (const char *)s_ack_stage;
 }
 
-static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+/* The bills this loop pays on every beat: the vblank acknowledgement, and the
+ * busy/idle bits the title polls in 0x001912E0 and 0x00193E40.
+ *
+ * On the console none of that belongs to a CPU thread -- the video pipe raises
+ * its own interrupt and PGRAPH retires its own work. Here the one thread that
+ * stands in for the GPU pays them, and it also runs guest-built pushbuffer
+ * methods, so a method that takes a second (a shader compiled in the host
+ * driver, a swap) stops the clock for the whole title: the main thread spins on
+ * PFIFO_CACHE1_STATUS bit 16 and the vblank thread on PMC_INTR_0, and neither
+ * bit moves until this loop comes back. Factored out so the timer thread can
+ * pay them when this one is away too long. */
+static void ack_service_core(volatile uint32_t *regs, int stage)
 {
-    volatile uint32_t *regs = (volatile uint32_t *)param;
-    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        s_ack_beat++;
-        ACK_STAGE("vblank ack");
-        vblank_intr_tick(regs);
+    if (stage) ACK_STAGE("vblank ack");
+    vblank_intr_tick(regs);
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
@@ -784,6 +800,44 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *r |= NV2A_IDLE[i].idle_mask;
             }
         }
+}
+
+/* Pay one beat's bills from whatever thread notices this one is stuck.
+ *
+ * Threshold is high enough that a normally slow beat is left alone, low enough
+ * that the title does not sit through a full second of a bit that hardware
+ * would have cleared by itself. The stage variables are left untouched: the
+ * report must still say where the ack thread really is, not where the rescuer
+ * was. */
+static volatile unsigned long s_ack_rescues;
+static volatile long long s_ack_rescue_note;
+
+void xbox_nv2a_ack_rescue(void)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
+    long long now, away;
+
+    if (!regs || !s_ack_stage_ms) return;
+    now  = (long long)GetTickCount64();
+    away = now - s_ack_stage_ms;
+    if (away < 1500) return;
+    ack_service_core(regs, 0);
+    s_ack_rescues++;
+    if (now - s_ack_rescue_note >= 2000) {
+        s_ack_rescue_note = now;
+        fprintf(stderr, "  [NV2A] ack thread away %lld ms at stage \"%s\"; "
+                        "paid the vblank and idle bits for it (%lu times)\n",
+                away, (const char *)s_ack_stage, s_ack_rescues);
+        fflush(stderr);
+    }
+}
+
+static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        s_ack_beat++;
+        ack_service_core(regs, 1);
         {
             volatile uint32_t *put =
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
@@ -842,8 +896,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * guess. */
                     int scanned = 0;
                     if (last_put && put > last_put) {
+                        ACK_STAGE_TAG("pb scan", put);
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                        ACK_STAGE_TAG("pb scanned", put);
                         scanned = 1;
                     } else if (last_put && put < last_put) {
                         /* The ring wrapped: PUT went back to its start.
@@ -860,7 +916,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                          ? from + 0x20000u : 0x84000000u);
                         if (j) {
                             j = XBOX_CONTIG_BASE | (j & 0x0FFFFFFFu);
-                            if (j < to) { nv2a_pb_scan(j, to); scanned = 1; }
+                            if (j < to) {
+                                ACK_STAGE_TAG("pb scan wrap", j);
+                                nv2a_pb_scan(j, to);
+                                ACK_STAGE_TAG("pb scanned", to);
+                                scanned = 1;
+                            }
                         }
                     }
                     /* The segment was read but not decoded to its end, and the
@@ -876,7 +937,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             static int said;
                             if (now_ms - last_force > 2000) {
                                 last_force = now_ms;
+                                ACK_STAGE("pb release");
                                 xbox_Nv2aReleaseStalledRing();
+                                ACK_STAGE("pb released");
                                 if (said++ < 24) {
                                     fprintf(stderr, "  [PB] segment %08X..%08X not"
                                                     " decoded past %08X: ring released"
@@ -892,7 +955,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * question the survey answers is about the latter. */
                     if (now_ms - last_report > 10000) {
                         last_report = now_ms;
+                        ACK_STAGE("pb report");
                         nv2a_pb_scan_report();
+                        ACK_STAGE("pb reported");
                         reported = 1;
                     }
                 }
@@ -919,10 +984,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     if (every < 0) every = getenv("RECOMP_NV2A_TRACE") != NULL;
                     if (every || idle || reported) {
+                        ACK_STAGE("pb print");
                         fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
                                 "0x%08X%s\n", put, g,
                                 g == put ? "" : "  (GPU behind)");
                         fflush(stderr);
+                        ACK_STAGE_TAG("pushbuffer trace", put);
                     }
                 }
             }
@@ -994,9 +1061,9 @@ static void xbox_Nv2aAckStart(void)
      * setup: the Switch allocates its windows through guest_window_alloc and
      * never ran that code, so the flag stayed zero and no pushbuffer was ever
      * executed there. */
-    s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
-                || getenv("RECOMP_PB_SCAN") != NULL
-                || getenv("RECOMP_PB_EXEC") != NULL;
+    s_nv2a_trace = nv2a_env_on("RECOMP_NV2A_TRACE", 0)
+                || nv2a_env_on("RECOMP_PB_SCAN", 0)
+                || nv2a_env_on("RECOMP_PB_EXEC", 0);
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);

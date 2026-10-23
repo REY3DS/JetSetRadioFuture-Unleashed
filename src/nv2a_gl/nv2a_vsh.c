@@ -573,8 +573,27 @@ static void emit_viewport_epilogue(SB *sb, int ff)
 static void emit_program_body(SB *sb, const Nv2aVshProgram *p)
 {
     int i;
-    for (i = 0; i < NV2A_VSH_NUM_TEMPS - 1; i++)
+    /* Every temporary the instruction word can name, not just the twelve the
+     * hardware documents.
+     *
+     * The destination field is four bits, so a program can name 0..15; 12 is
+     * the position register and aliases oPos below. This declared only
+     * R0..R11, and a program in this title writes R13 -- the shader then
+     * failed to compile as a whole, and the draw it belonged to was simply
+     * not drawn:
+     *
+     *   [GL] translated vertex program + combiners failed to compile:
+     *   0:240(2): error: `R13' undeclared
+     *   0:267(43): error: no matching function for call to `max()'
+     *
+     * (the second is the first one cascading: an undeclared name has type
+     * "error", and every later call that takes it as an argument fails too.)
+     * Naming the four spares costs four vec4 and turns a missing draw into
+     * one whose result goes nowhere. */
+    for (i = 0; i < 16; i++) {
+        if (i == 12) continue;               /* R12 is oPos */
         sb_add(sb, "    vec4 R%d = vec4(0.0);\n", i);
+    }
     sb_add(sb,
         "    vec4 oPos = vec4(0.0, 0.0, 0.0, 1.0);\n"
         /* Fog defaults to NONE, not to full fog.

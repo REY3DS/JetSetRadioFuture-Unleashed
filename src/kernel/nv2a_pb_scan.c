@@ -26,6 +26,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* An environment flag is "on" when it is set to something other than "0".
+ * Presence alone is not enough: the settings file writes RECOMP_PB_EXEC=0 to
+ * mean "off", and a presence test read that as "on" -- so the A/B that was
+ * supposed to run without the pushbuffer executor ran with it, and the freeze
+ * it was meant to isolate happened anyway. */
+static int pb_env_on(const char *name, int dflt)
+{
+    const char *e = getenv(name);
+    if (!e || !*e) return dflt;
+    return !(e[0] == '0' && e[1] == 0);
+}
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 /* A pushbuffer word. The ack thread hands this the contiguous-window
  * form of DMA_PUT (0x80000000 | physical), which on the Switch is a
@@ -402,9 +414,9 @@ static uint32_t pb_walk_impl(uint32_t start_va, uint32_t end_va, int find_only)
      * -- thousands a second -- and getenv walks the environment doing a string
      * compare per entry every time it is called. */
     if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+        s_exec_enabled = pb_env_on("RECOMP_PB_EXEC", 0);
     if (s_scan_enabled < 0)
-        s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
+        s_scan_enabled = pb_env_on("RECOMP_PB_SCAN", 0);
     if (!(s_scan_enabled || s_exec_enabled) || end_va <= start_va)
         return 0;
 
@@ -544,11 +556,31 @@ static uint32_t pb_walk_impl(uint32_t start_va, uint32_t end_va, int find_only)
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
                 if (exec) {
+                    uint32_t param = pb_word(va);
+                    long long mt0 = (long long)GetTickCount();
                     g_pb_exec_va = va - 4;
                     g_pb_cur_va = va - 4;
                     g_pb_cur_method = w;
-                    g_pb_cur_param = pb_word(va);
-                    nv2a_pb_exec_method(subch, m, pb_word(va));
+                    g_pb_cur_param = param;
+                    nv2a_pb_exec_method(subch, m, param);
+                    /* One method, one clock pair. A method that does not come
+                     * back is not visible as a stuck walk -- the walk's own
+                     * guards are above this call and never get another turn --
+                     * and the machine stops with the ack thread inside it
+                     * while the vblank it owes the title is never paid. This
+                     * names it. */
+                    {
+                        long long mdt = (long long)GetTickCount() - mt0;
+                        if (mdt >= 500) {
+                            static int said;
+                            if (said++ < 40)
+                                fprintf(stderr,
+                                        "  [PB] method subch %u method %03X "
+                                        "param %08X at %08X took %lld ms\n",
+                                        subch, m, param, va - 4, mdt);
+                            fflush(stderr);
+                        }
+                    }
                 }
                 va += 4;
                 words++;
